@@ -123,12 +123,16 @@ export class VaultClient {
         }
     }
 }
-export function vaultSessionId(externalSessionId, agent, instanceId) {
+export function vaultSessionId(externalSessionId, agent, agentInstanceId) {
     const digest = createHash("sha256")
-        .update(`${agent}:${externalSessionId}:${instanceId}`)
+        .update(`${agentInstanceId}:${externalSessionId}`)
         .digest("hex")
         .slice(0, 24);
     return `session-${agent.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}-${digest}`;
+}
+export function recoverySessionId(sessionId) {
+    const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
+    return `session-recovery-${digest}`;
 }
 export function formatMemoryContext(value) {
     const topics = Array.isArray(value.topics)

@@ -17,6 +17,7 @@ from .indexer import Indexer
 from .embeddings import cosine_similarity, unpack_vector
 from .models import Message, SourceRange, Topic, utc_or_local_now
 from .recorder import SessionRecorder
+from .retriever import tokenize_query
 from .storage import (
     atomic_write_json,
     estimate_tokens,
@@ -94,7 +95,6 @@ class OpenAICompatibleMemoryLLM:
         if not self.config.base_url or not self.config.model:
             raise RuntimeError("memory_llm endpoint is not configured")
         cards: list[dict[str, Any]] = []
-        card_tokens = 0
         for topic in topic_cards or current_topics:
             card = {
                 "id": topic.id,
@@ -104,17 +104,12 @@ class OpenAICompatibleMemoryLLM:
                 "keywords": topic.keywords,
                 "status": topic.status,
             }
-            cost = estimate_tokens(json.dumps(card, ensure_ascii=False))
-            if card_tokens + cost > self.input_budgets.topic_cards_budget_tokens:
+            cost = estimate_tokens(json.dumps([*cards, card], ensure_ascii=False))
+            if cost > self.input_budgets.topic_cards_budget_tokens:
                 break
             cards.append(card)
-            card_tokens += cost
         current: list[dict[str, Any]] = []
-        summary_tokens = 0
         for topic in current_topics[: self.input_budgets.existing_summaries_top_k]:
-            remaining = self.input_budgets.existing_summaries_budget_tokens - summary_tokens
-            if remaining <= 0:
-                break
             card = {
                 "id": topic.id,
                 "title": topic.title,
@@ -123,17 +118,24 @@ class OpenAICompatibleMemoryLLM:
                 "keywords": topic.keywords,
                 "status": topic.status,
             }
-            card_cost = estimate_tokens(json.dumps(card, ensure_ascii=False))
-            summary_room = remaining - card_cost
-            if summary_room <= 0:
+            empty_item = {**card, "summary": ""}
+            if estimate_tokens(
+                json.dumps([*current, empty_item], ensure_ascii=False)
+            ) > self.input_budgets.existing_summaries_budget_tokens:
                 break
-            summary = topic.summary[: summary_room * 4]
+            low, high = 0, len(topic.summary)
+            while low < high:
+                middle = (low + high + 1) // 2
+                candidate = {**card, "summary": topic.summary[:middle]}
+                if estimate_tokens(
+                    json.dumps([*current, candidate], ensure_ascii=False)
+                ) <= self.input_budgets.existing_summaries_budget_tokens:
+                    low = middle
+                else:
+                    high = middle - 1
+            summary = topic.summary[:low]
             item = {**card, "summary": summary}
-            cost = estimate_tokens(json.dumps(item, ensure_ascii=False))
-            if summary_tokens + cost > self.input_budgets.existing_summaries_budget_tokens:
-                break
             current.append(item)
-            summary_tokens += cost
         incoming = [message.to_dict() for message in messages]
         user_payload = {
             "finalizing": finalizing,
@@ -324,12 +326,20 @@ class MemorySummarizer:
                 used = 0
             if cost > budget:
                 # The full turn remains in transcript; only its LLM view is bounded.
-                max_chars = max(1_000, budget * 4 - 400)
+                marker = (
+                    "\n[Memory summarizer input truncated; open source turn for full text.]"
+                )
+                low, high = 0, len(message.text)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if estimate_tokens(message.text[:middle] + marker) + 30 <= budget:
+                        low = middle
+                    else:
+                        high = middle - 1
                 message = Message(
                     id=message.id,
                     role=message.role,
-                    text=message.text[:max_chars]
-                    + "\n[Memory summarizer input truncated; open source turn for full text.]",
+                    text=message.text[:low] + marker,
                     created_at=message.created_at,
                     metadata=message.metadata,
                 )
@@ -465,22 +475,34 @@ class MemorySummarizer:
         if not topics:
             return []
         query = "\n".join(message.text for message in messages)
-        words = sorted(set(re.findall(r"[\w.+#/-]{2,}", query.lower())))[:24]
+        query_tokens = set(tokenize_query(query))
+        words = sorted(query_tokens)[:24]
         expression = " OR ".join(
             f'"{word.replace(chr(34), chr(34) * 2)}"' for word in words
         )
-        lexical_ids = [
-            str(row["id"])
-            for row in (
-                self.catalog.lexical_search(
-                    expression,
-                    self.config.summarization.existing_summaries_top_k * 3,
-                    session_id=topics[0].session_id,
-                )
-                if expression
-                else []
+        lexical_rows = (
+            self.catalog.lexical_search(
+                expression,
+                self.config.summarization.existing_summaries_top_k * 3,
+                session_id=topics[0].session_id,
             )
-        ]
+            if expression
+            else []
+        )
+        lexical_ids: list[str] = []
+        for row in lexical_rows:
+            searchable = " ".join(
+                str(row[key])
+                for key in ("title", "description", "problem", "keywords", "summary")
+            )
+            topic_tokens = set(tokenize_query(searchable))
+            coverage = (
+                len(query_tokens & topic_tokens) / len(query_tokens)
+                if query_tokens
+                else 0.0
+            )
+            if coverage >= self.config.retrieval.lexical_min_query_coverage:
+                lexical_ids.append(str(row["id"]))
         vector_scores: list[tuple[float, str]] = []
         if self.indexer.embedder is not None:
             try:
@@ -491,9 +513,9 @@ class MemorySummarizer:
                         and int(row["dimension"]) == len(query_vector)
                     ):
                         vector = unpack_vector(row["embedding"], int(row["dimension"]))
-                        vector_scores.append(
-                            (cosine_similarity(query_vector, vector), str(row["topic_id"]))
-                        )
+                        similarity = cosine_similarity(query_vector, vector)
+                        if similarity >= self.config.retrieval.vector_min_similarity:
+                            vector_scores.append((similarity, str(row["topic_id"])))
                 vector_scores.sort(reverse=True)
             except Exception as exc:
                 logger.warning("summary topic retrieval embedding failed: %s", exc)
@@ -502,6 +524,8 @@ class MemorySummarizer:
             ranks[topic_id] = ranks.get(topic_id, 0.0) + 1.0 / (60 + rank)
         for rank, (_, topic_id) in enumerate(vector_scores, 1):
             ranks[topic_id] = ranks.get(topic_id, 0.0) + 1.0 / (60 + rank)
+        if not ranks:
+            return []
         ordered = sorted(
             topics,
             key=lambda topic: (ranks.get(topic.id, 0.0), topic.updated_at),

@@ -10,6 +10,9 @@ Before either adapter contacts the API, captured events are appended and
 `fsync`ed to `data/spool/openclaw.jsonl` or `data/spool/hermes.jsonl`. Successful
 delivery appends a durable acknowledgement. Pending events are replayed in order
 after an agent or Vault restart, and stable event IDs make retries idempotent.
+Permanent invalid events are fsync-quarantined in adjacent `*.dead-letter.jsonl`
+files so they cannot block later turns. Authentication failures stop delivery;
+network errors and server failures remain pending for retry.
 
 ## Shared memory workflow
 
@@ -54,7 +57,9 @@ does not abort the agent turn or lose its captured message. Configuration keys
 are documented in `openclaw.plugin.json`; the default API is
 `http://127.0.0.1:8765` and the default spool is
 `~/mnemonic-vault/data/spool/openclaw.jsonl` when the plugin is installed outside
-the project tree.
+the project tree. `agentInstanceId` defaults to the persistent identity
+`openclaw-main`; give each independent OpenClaw installation a different stable
+value. Changing it intentionally starts a new Vault-session namespace.
 
 ## Hermes `MemoryProvider`
 
@@ -88,9 +93,14 @@ Recall is prefetched in a small thread pool with a bounded timeout.
 | `MNEMONIC_VAULT_AUTO_RECALL` | `true` |
 | `MNEMONIC_VAULT_MAX_TOPICS` | `5` |
 | `MNEMONIC_VAULT_SUMMARY_BUDGET_TOKENS` | `1500` |
+| `MNEMONIC_VAULT_AGENT_INSTANCE_ID` | `hermes-main` |
 | `MNEMONIC_VAULT_API_TOKEN` | empty on loopback |
 | `MNEMONIC_VAULT_PROJECT_ROOT` | source tree or `~/mnemonic-vault` |
 | `MNEMONIC_VAULT_SPOOL_DIR` | `<project>/data/spool` |
+
+`MNEMONIC_VAULT_AGENT_INSTANCE_ID` must stay unchanged across process restarts.
+Use a distinct stable value for each independent Hermes installation. Upgrading
+from 0.3.0 creates one new stable session boundary; subsequent restarts keep using it.
 
 ## Verified `.14` topology
 
