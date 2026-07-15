@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import os
+import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -13,31 +15,33 @@ from .service import Services, build_services
 
 
 class StartSessionRequest(BaseModel):
-    agent: str = "unknown"
-    session_id: str | None = None
-    started_at: str | None = None
+    agent: str = Field(default="unknown", min_length=1, max_length=128)
+    session_id: str | None = Field(default=None, max_length=128)
+    started_at: str | None = Field(default=None, max_length=64)
 
 
 class AppendMessageRequest(BaseModel):
-    role: str
-    content: str
-    created_at: str | None = None
+    role: str = Field(min_length=1, max_length=64)
+    content: str = Field(min_length=1, max_length=1_000_000)
+    created_at: str | None = Field(default=None, max_length=64)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    external_event_id: str | None = Field(default=None, max_length=128)
 
 
 class EndSessionRequest(BaseModel):
-    ended_at: str | None = None
+    ended_at: str | None = Field(default=None, max_length=64)
 
 
 class SearchRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=100_000)
     max_topics: int = Field(default=5, ge=1, le=50)
-    summary_budget_tokens: int = Field(default=1800, ge=100, le=32000)
+    summary_budget_tokens: int | None = Field(default=None, ge=100, le=32000)
+    total_context_budget_tokens: int | None = Field(default=None, ge=100, le=32000)
     include_sources: Literal["auto", "always", "never"] = "auto"
 
 
 class ExpandRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=100_000)
     max_fragments: int = Field(default=5, ge=1, le=20)
     token_budget: int | None = Field(default=None, ge=100, le=32000)
 
@@ -73,10 +77,27 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
     app.state.services = services
+    api_token = os.environ.get(services.config.api.bearer_token_env, "")
+
+    @app.middleware("http")
+    async def bearer_auth(request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > services.config.api.max_request_bytes:
+                    return _json_error(413, "request body is too large")
+            except ValueError:
+                return _json_error(400, "invalid content-length")
+        if api_token and request.url.path.startswith("/v1/"):
+            authorization = request.headers.get("authorization", "")
+            expected = f"Bearer {api_token}"
+            if not secrets.compare_digest(authorization, expected):
+                return _json_error(401, "missing or invalid bearer token")
+        return await call_next(request)
 
     @app.exception_handler(FileNotFoundError)
     async def not_found(_: Request, exc: FileNotFoundError):
@@ -104,12 +125,15 @@ def create_app(
     def append_message(
         session_id: str, payload: AppendMessageRequest
     ) -> dict[str, Any]:
+        if len(payload.content) > services.config.api.max_message_chars:
+            raise HTTPException(status_code=413, detail="message is too large")
         return services.recorder.append(
             session_id,
             payload.role,
             payload.content,
             payload.created_at,
             payload.metadata,
+            payload.external_event_id,
         ).to_dict()
 
     @app.post("/v1/sessions/{session_id}/end")
@@ -135,11 +159,14 @@ def create_app(
 
     @app.post("/v1/memory/search")
     def search_memory(payload: SearchRequest) -> dict[str, Any]:
+        if len(payload.query) > services.config.api.max_query_chars:
+            raise HTTPException(status_code=413, detail="query is too large")
         return services.context_builder.build(
             payload.query,
             payload.max_topics,
             payload.summary_budget_tokens,
             payload.include_sources,
+            payload.total_context_budget_tokens,
         )
 
     @app.get("/v1/memory/topics/{topic_id}")
@@ -149,6 +176,8 @@ def create_app(
 
     @app.post("/v1/memory/topics/{topic_id}/expand")
     def expand_topic(topic_id: str, payload: ExpandRequest) -> dict[str, Any]:
+        if len(payload.query) > services.config.api.max_query_chars:
+            raise HTTPException(status_code=413, detail="query is too large")
         return {
             "topic_id": topic_id,
             "fragments": services.retriever.expand_topic(
@@ -161,6 +190,8 @@ def create_app(
 
     @app.post("/v1/memory/search-transcript")
     def search_transcript(payload: ExpandRequest, session_id: str | None = None):
+        if len(payload.query) > services.config.api.max_query_chars:
+            raise HTTPException(status_code=413, detail="query is too large")
         return {
             "fragments": services.retriever.search_transcript(
                 payload.query, session_id, payload.max_fragments

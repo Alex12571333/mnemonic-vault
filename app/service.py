@@ -29,7 +29,7 @@ class Services:
 
 def build_services(config: AppConfig) -> Services:
     config.storage.root.mkdir(parents=True, exist_ok=True)
-    for name in ("attachments", "exports", "backups"):
+    for name in ("attachments", "exports", "backups", "jobs", "spool"):
         (config.storage.root / name).mkdir(parents=True, exist_ok=True)
     (config.project_root / "logs").mkdir(parents=True, exist_ok=True)
     catalog = Catalog(config.storage.catalog_db)
@@ -45,7 +45,9 @@ def build_services(config: AppConfig) -> Services:
     retriever = Retriever(config, catalog, recorder, embedder)
     context_builder = ContextBuilder(config, retriever)
     llm = OpenAICompatibleMemoryLLM(
-        config.memory_llm, config.summarization.max_output_tokens
+        config.memory_llm,
+        config.summarization.max_output_tokens,
+        config.summarization,
     )
     summarizer = MemorySummarizer(
         config, catalog, recorder, indexer, llm

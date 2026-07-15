@@ -7,7 +7,7 @@ from .catalog import Catalog
 from .config import AppConfig
 from .embeddings import Embedder, pack_vector, topic_embedding_text
 from .models import Topic, utc_or_local_now
-from .storage import read_session, read_topic
+from .storage import read_messages, read_session, read_topic
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,12 @@ class Indexer:
         topic = read_topic(path)
         topic.path = str(path)
         self.catalog.upsert_topic(topic, path)
-        if with_embedding and self.embedder is not None:
+        if with_embedding:
+            self.index_embedding(topic)
+        return topic
+
+    def index_embedding(self, topic: Topic) -> None:
+        if self.embedder is not None:
             try:
                 vector = self.embedder.embed(
                     [
@@ -52,12 +57,12 @@ class Indexer:
             except Exception as exc:
                 # Lexical retrieval remains available when the optional endpoint is down.
                 logger.warning("could not embed topic %s: %s", topic.id, exc)
-        return topic
 
     def rebuild(self, with_embeddings: bool = False) -> dict[str, int]:
         self.catalog.delete_all_index_data()
         sessions = 0
         topics = 0
+        messages = 0
         failures = 0
         recovered_jobs = 0
         for session_file in sorted(
@@ -67,6 +72,13 @@ class Indexer:
                 session = read_session(session_file.parent)
                 self.catalog.upsert_session(session, session_file.parent)
                 sessions += 1
+                for message in read_messages(session_file.parent / "transcript.jsonl"):
+                    self.catalog.index_message(
+                        session.id,
+                        message,
+                        str(message.metadata.get("external_event_id") or "") or None,
+                    )
+                    messages += 1
                 if session.message_count > session.processed_until_message:
                     job_id = self.catalog.enqueue_job(
                         session.id,
@@ -89,6 +101,7 @@ class Indexer:
         return {
             "sessions": sessions,
             "topics": topics,
+            "messages": messages,
             "recovered_jobs": recovered_jobs,
             "failures": failures,
         }

@@ -9,16 +9,30 @@ summarization:
   idle_minutes: 30
   max_input_tokens: 16000
   max_output_tokens: 2500
+  new_messages_budget_tokens: 9000
+  topic_cards_budget_tokens: 2000
+  existing_summaries_budget_tokens: 4000
+  existing_summaries_top_k: 8
 
 retrieval:
   lexical_top_k: 30
   vector_top_k: 30
   final_top_k: 5
   auto_open_summaries: 2
-  summary_budget_tokens: 1800
-  source_budget_tokens: 1800
+  total_context_budget_tokens: 3000
+  card_budget_tokens: 300
+  summary_budget_tokens: 1500
+  source_budget_tokens: 1200
   minimum_score: 0.35
+  vector_min_similarity: 0.35
+  lexical_min_query_coverage: 0.34
   rrf_k: 60
+
+api:
+  bearer_token_env: "MNEMONIC_VAULT_API_TOKEN"
+  max_request_bytes: 262144
+  max_message_chars: 100000
+  max_query_chars: 20000
 
 memory_llm:
   # Проверено с хоста .14: активный vLLM endpoint Qwen работает на DGX Spark .10.
@@ -29,9 +43,9 @@ memory_llm:
   timeout_seconds: 180
 
 embeddings:
-  # FastEmbed запускается внутри процесса на .14; модель и cache лежат в data/models/.
+  # Multilingual FastEmbed запускается внутри процесса на .14; cache лежит в data/models/.
   provider: "fastembed"
   base_url: ""
-  model: "sentence-transformers/all-MiniLM-L6-v2"
+  model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
   dimension: 384
   timeout_seconds: 30

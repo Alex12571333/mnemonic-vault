@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -9,7 +10,7 @@ from .config import AppConfig
 from .embeddings import Embedder, cosine_similarity, pack_vector, unpack_vector
 from .models import Message, SearchHit, Topic
 from .recorder import SessionRecorder
-from .storage import estimate_tokens, read_messages, read_topic, validate_id
+from .storage import estimate_tokens, read_topic, validate_id
 
 
 WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
@@ -71,8 +72,31 @@ class Retriever:
             lexical_rows = self.catalog.lexical_search(
                 expression, retrieval.lexical_top_k
             )
-        lexical_ids = [str(row["id"]) for row in lexical_rows]
-        vector_ids = self._vector_search(query, retrieval.vector_top_k)
+        query_tokens = set(tokenize_query(query))
+        lexical_relevance: dict[str, float] = {}
+        for row in lexical_rows:
+            searchable = " ".join(
+                str(row[key]) for key in ("title", "description", "problem", "keywords", "summary")
+            )
+            topic_tokens = set(tokenize_query(searchable))
+            lexical_relevance[str(row["id"])] = (
+                len(query_tokens & topic_tokens) / len(query_tokens)
+                if query_tokens
+                else 0.0
+            )
+        vector_scores = self._vector_search(query, retrieval.vector_top_k)
+
+        lexical_ids = [
+            str(row["id"])
+            for row in lexical_rows
+            if lexical_relevance[str(row["id"])]
+            >= retrieval.lexical_min_query_coverage
+        ]
+        vector_ids = [
+            topic_id
+            for topic_id, similarity in vector_scores.items()
+            if similarity >= retrieval.vector_min_similarity
+        ]
 
         ranks: dict[str, dict[str, int]] = {}
         for rank, topic_id in enumerate(lexical_ids, 1):
@@ -87,11 +111,13 @@ class Retriever:
             raw_scores[topic_id] = sum(
                 1.0 / (retrieval.rrf_k + rank) for rank in channels.values()
             )
-        maximum = max(raw_scores.values())
         ordered = sorted(raw_scores, key=raw_scores.get, reverse=True)
-        hits: list[SearchHit] = []
+        candidates: list[SearchHit] = []
         for topic_id in ordered:
-            score = raw_scores[topic_id] / maximum if maximum else 0.0
+            score = max(
+                lexical_relevance.get(topic_id, 0.0),
+                vector_scores.get(topic_id, -1.0),
+            )
             if score < retrieval.minimum_score:
                 continue
             path = self.catalog.topic_path(topic_id)
@@ -99,18 +125,20 @@ class Retriever:
                 continue
             topic = read_topic(path)
             topic.path = self._portable_path(path)
+            self._attach_session_dates(topic)
             channels = ranks[topic_id]
-            hits.append(
+            candidates.append(
                 SearchHit(
                     topic=topic,
                     score=score,
                     lexical_rank=channels.get("lexical"),
                     vector_rank=channels.get("vector"),
+                    lexical_relevance=lexical_relevance.get(topic_id, 0.0),
+                    vector_similarity=vector_scores.get(topic_id),
+                    rrf_score=raw_scores[topic_id],
                 )
             )
-            if len(hits) >= (max_topics or retrieval.final_top_k):
-                break
-        return hits
+        return self._diversify(candidates, max_topics or retrieval.final_top_k)
 
     def get_topic(self, topic_id: str) -> Topic:
         validate_id(topic_id, "topic id")
@@ -119,7 +147,44 @@ class Retriever:
             raise FileNotFoundError(topic_id)
         topic = read_topic(path)
         topic.path = self._portable_path(path)
+        self._attach_session_dates(topic)
         return topic
+
+    def _attach_session_dates(self, topic: Topic) -> None:
+        row = self.catalog.get_session(topic.session_id)
+        if row is not None:
+            topic.session_started_at = str(row["started_at"] or "")
+            topic.session_ended_at = str(row["ended_at"]) if row["ended_at"] else None
+
+    def _diversify(self, candidates: list[SearchHit], limit: int) -> list[SearchHit]:
+        groups: list[SearchHit] = []
+        for candidate in candidates:
+            candidate_tokens = set(
+                tokenize_query(f"{candidate.topic.title} {candidate.topic.problem}")
+            )
+            duplicate_index: int | None = None
+            for index, existing in enumerate(groups):
+                existing_tokens = set(
+                    tokenize_query(f"{existing.topic.title} {existing.topic.problem}")
+                )
+                union = candidate_tokens | existing_tokens
+                similarity = len(candidate_tokens & existing_tokens) / len(union) if union else 0.0
+                if similarity >= 0.72:
+                    duplicate_index = index
+                    break
+            if duplicate_index is None:
+                groups.append(candidate)
+                continue
+            existing = groups[duplicate_index]
+            if candidate.topic.updated_at > existing.topic.updated_at:
+                candidate.related_older_topic_ids = [
+                    existing.topic.id,
+                    *existing.related_older_topic_ids,
+                ]
+                groups[duplicate_index] = candidate
+            else:
+                existing.related_older_topic_ids.append(candidate.topic.id)
+        return groups[:limit]
 
     def _portable_path(self, path: Path) -> str:
         try:
@@ -155,39 +220,46 @@ class Retriever:
         session_id: str | None = None,
         max_fragments: int = 10,
     ) -> list[dict[str, Any]]:
-        sessions: Iterable[Path]
-        if session_id:
-            sessions = [self.recorder.locate(session_id)]
-        else:
-            sessions = (
-                item.parent
-                for item in self.config.storage.sessions_dir.glob("*/*/*/session.json")
+        expression = fts_query(query)
+        if not expression:
+            return []
+        rows = self.catalog.search_messages(
+            expression, max(max_fragments * 8, 40), session_id=session_id
+        )
+        candidates = [
+            Message(
+                id=int(row["message_id"]),
+                role=str(row["role"]),
+                text=str(row["content"]),
+                created_at=str(row["created_at"]),
+                metadata={"_session_id": str(row["session_id"])},
             )
-        candidates: list[Message] = []
-        for path in sessions:
-            for message in read_messages(path / "transcript.jsonl"):
-                message.metadata["_session_id"] = path.name
-                candidates.append(message)
+            for row in rows
+        ]
         ranked = rank_messages(candidates, query, max_fragments=max_fragments)
         return ranked
 
-    def _vector_search(self, query: str, limit: int) -> list[str]:
+    def _vector_search(self, query: str, limit: int) -> dict[str, float]:
         if self.embedder is None:
-            return []
+            return {}
         try:
             query_vector = self.embedder.embed([query])[0]
         except Exception:
-            return []
+            return {}
         indexed = self.catalog.vector_search(
             self.embedder.model, pack_vector(query_vector), len(query_vector), limit
         )
-        if len(indexed) >= limit:
-            return indexed
+        scores = {
+            str(item["topic_id"]): float(item["cosine_similarity"])
+            for item in indexed
+        }
+        if len(scores) >= limit:
+            return scores
         scored: list[tuple[float, str]] = []
         for row in self.catalog.list_embeddings():
             if row["model"] != self.embedder.model:
                 continue
-            if row["topic_id"] in indexed:
+            if row["topic_id"] in scores:
                 continue
             if int(row["dimension"]) != len(query_vector):
                 continue
@@ -196,7 +268,9 @@ class Retriever:
             if score > 0.0:
                 scored.append((score, str(row["topic_id"])))
         scored.sort(reverse=True)
-        return indexed + [topic_id for _, topic_id in scored[: max(0, limit - len(indexed))]]
+        for score, topic_id in scored[: max(0, limit - len(scores))]:
+            scores[topic_id] = score
+        return scores
 
 
 class ContextBuilder:
@@ -210,49 +284,152 @@ class ContextBuilder:
         max_topics: int | None = None,
         summary_budget_tokens: int | None = None,
         include_sources: str = "auto",
+        total_context_budget_tokens: int | None = None,
     ) -> dict[str, Any]:
         if include_sources not in {"auto", "always", "never"}:
             raise ValueError("include_sources must be auto, always, or never")
         config = self.config.retrieval
         max_topics = max_topics or config.final_top_k
-        budget = summary_budget_tokens or config.summary_budget_tokens
+        total_budget = min(
+            total_context_budget_tokens or config.total_context_budget_tokens,
+            config.total_context_budget_tokens,
+        )
+        summary_budget = min(
+            summary_budget_tokens or config.summary_budget_tokens,
+            config.summary_budget_tokens,
+            total_budget,
+        )
         hits = self.retriever.search(query, max_topics=max_topics)
         used = 0
+        card_used = 0
+        summary_used = 0
+        source_used = 0
         summaries_opened = 0
         output: list[dict[str, Any]] = []
         auto_precision = bool(PRECISION_QUERY.search(query)) or any(
             pattern in query.lower() for pattern in PRECISION_PATTERNS
         )
         for hit in hits:
-            item = hit.to_dict(include_summary=False)
-            card_tokens = estimate_tokens(
-                f"{hit.topic.title}\n{hit.topic.description}\n{hit.topic.problem}"
-            )
+            item = compact_hit_card(hit, config.card_budget_tokens - card_used)
+            card_tokens = estimate_tokens(json.dumps(item, ensure_ascii=False))
+            if (
+                not item
+                or card_used + card_tokens > config.card_budget_tokens
+                or used + card_tokens > total_budget
+            ):
+                break
             used += card_tokens
-            summary_tokens = estimate_tokens(hit.topic.summary)
-            if summaries_opened < config.auto_open_summaries and used + summary_tokens <= budget:
-                item["summary"] = hit.topic.summary
+            card_used += card_tokens
+            remaining_summary = min(
+                summary_budget - summary_used,
+                total_budget - used,
+            )
+            summary, summary_tokens = bounded_json_text(
+                "summary", hit.topic.summary, remaining_summary
+            )
+            if summaries_opened < config.auto_open_summaries and summary:
+                item["summary"] = summary
                 used += summary_tokens
+                summary_used += summary_tokens
                 summaries_opened += 1
             should_expand = include_sources == "always" or (
                 include_sources == "auto" and auto_precision
             )
             if should_expand and "summary" in item:
+                remaining_source = min(
+                    config.source_budget_tokens - source_used,
+                    total_budget - used,
+                )
                 fragments = self.retriever.expand_topic(
                     hit.topic.id,
                     query,
                     max_fragments=5,
-                    token_budget=config.source_budget_tokens,
-                )
+                    token_budget=max(1, remaining_source - 24),
+                ) if remaining_source > 0 else []
                 if fragments:
-                    item["source_fragments"] = fragments
-                    used += sum(estimate_tokens(value["text"]) for value in fragments)
+                    fragment_tokens = estimate_tokens(
+                        json.dumps({"source_fragments": fragments}, ensure_ascii=False)
+                    )
+                    while fragments and fragment_tokens > remaining_source:
+                        fragments.pop()
+                        fragment_tokens = estimate_tokens(
+                            json.dumps({"source_fragments": fragments}, ensure_ascii=False)
+                        )
+                    if fragments:
+                        item["source_fragments"] = fragments
+                        used += fragment_tokens
+                        source_used += fragment_tokens
             output.append(item)
         return {
             "topics": output,
             "used_tokens": used,
+            "budget_tokens": total_budget,
+            "budget_breakdown": {
+                "cards": card_used,
+                "summaries": summary_used,
+                "sources": source_used,
+            },
             "can_expand": bool(output),
         }
+
+
+def compact_hit_card(hit: SearchHit, token_budget: int) -> dict[str, Any]:
+    """Keep a useful topic card inside its sub-budget without hiding overflow."""
+    if token_budget <= 0:
+        return {}
+    item = hit.to_dict(include_summary=False)
+    item["keywords"] = list(item.get("keywords", []))
+    if "related_older_topic_ids" in item:
+        item["related_older_topic_ids"] = list(item["related_older_topic_ids"])
+
+    def cost() -> int:
+        return estimate_tokens(json.dumps(item, ensure_ascii=False))
+
+    ranges = item.get("source_ranges", [])
+    original_ranges = len(ranges) if isinstance(ranges, list) else 0
+    while isinstance(ranges, list) and len(ranges) > 1 and cost() > token_budget:
+        ranges.pop()
+    if isinstance(ranges, list) and len(ranges) < original_ranges:
+        item["source_ranges_omitted"] = original_ranges - len(ranges)
+    keywords = item.get("keywords", [])
+    while isinstance(keywords, list) and len(keywords) > 3 and cost() > token_budget:
+        keywords.pop()
+    older = item.get("related_older_topic_ids", [])
+    while isinstance(older, list) and len(older) > 1 and cost() > token_budget:
+        older.pop()
+    for field in ("description", "problem", "title"):
+        if cost() <= token_budget:
+            break
+        value = str(item.get(field, ""))
+        overflow_chars = max(16, (cost() - token_budget) * 4 + 16)
+        keep = max(0, len(value) - overflow_chars)
+        item[field] = value[:keep] + ("…" if keep else "")
+    return item if cost() <= token_budget else {}
+
+
+def bounded_json_text(field: str, text: str, token_budget: int) -> tuple[str, int]:
+    """Truncate one JSON string field to a deterministic tokenizer-independent budget."""
+    if token_budget <= 0:
+        return "", 0
+
+    def cost(value: str) -> int:
+        return estimate_tokens(json.dumps({field: value}, ensure_ascii=False))
+
+    if cost(text) <= token_budget:
+        return text, cost(text)
+    marker = "\n[truncated to context budget]"
+    if cost(marker) > token_budget:
+        return "", 0
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = text[:middle] + marker
+        if cost(candidate) <= token_budget:
+            low = middle
+        else:
+            high = middle - 1
+    value = text[:low] + marker
+    return value, cost(value)
 
 
 def rank_messages(
@@ -262,7 +439,7 @@ def rank_messages(
     token_budget: int = 1_800,
 ) -> list[dict[str, Any]]:
     tokens = tokenize_query(query)
-    if not messages:
+    if not messages or not tokens:
         return []
 
     def score(message: Message) -> tuple[int, int]:
@@ -272,10 +449,10 @@ def rank_messages(
         return exact * 100 + matches, message.id
 
     ranked = sorted(messages, key=score, reverse=True)
-    if tokens:
-        matched = [message for message in ranked if score(message)[0] > 0]
-        if matched:
-            ranked = matched
+    matched = [message for message in ranked if score(message)[0] > 0]
+    if not matched:
+        return []
+    ranked = matched
     result: list[dict[str, Any]] = []
     used = 0
     for message in ranked:
@@ -284,8 +461,19 @@ def rank_messages(
             continue
         text = message.text
         if not result and cost > token_budget:
-            text = text[: max(800, token_budget * 4)] + "\n[fragment truncated]"
+            marker = "\n[fragment truncated]"
+            marker_cost = estimate_tokens(marker)
+            if token_budget <= marker_cost:
+                return []
+            allowed = max(1, (token_budget - marker_cost) * 4)
+            text = text[:allowed] + marker
             cost = estimate_tokens(text)
+            while cost > token_budget and allowed > 1:
+                allowed = max(1, allowed - 4)
+                text = message.text[:allowed] + marker
+                cost = estimate_tokens(text)
+            if cost > token_budget:
+                return []
         fragment = {
             "id": message.id,
             "role": message.role,

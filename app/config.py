@@ -20,6 +20,10 @@ class SummarizationConfig:
     idle_minutes: int = 30
     max_input_tokens: int = 16_000
     max_output_tokens: int = 2_500
+    new_messages_budget_tokens: int = 9_000
+    topic_cards_budget_tokens: int = 2_000
+    existing_summaries_budget_tokens: int = 4_000
+    existing_summaries_top_k: int = 8
 
 
 @dataclass(slots=True)
@@ -28,10 +32,22 @@ class RetrievalConfig:
     vector_top_k: int = 30
     final_top_k: int = 5
     auto_open_summaries: int = 2
-    summary_budget_tokens: int = 1_800
-    source_budget_tokens: int = 1_800
+    total_context_budget_tokens: int = 3_000
+    card_budget_tokens: int = 300
+    summary_budget_tokens: int = 1_500
+    source_budget_tokens: int = 1_200
     minimum_score: float = 0.35
+    vector_min_similarity: float = 0.35
+    lexical_min_query_coverage: float = 0.34
     rrf_k: int = 60
+
+
+@dataclass(slots=True)
+class ApiConfig:
+    bearer_token_env: str = "MNEMONIC_VAULT_API_TOKEN"
+    max_request_bytes: int = 262_144
+    max_message_chars: int = 100_000
+    max_query_chars: int = 20_000
 
 
 @dataclass(slots=True)
@@ -62,6 +78,7 @@ class AppConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     memory_llm: MemoryLLMConfig = field(default_factory=MemoryLLMConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
+    api: ApiConfig = field(default_factory=ApiConfig)
 
     @classmethod
     def load(cls, path: str | Path = "config/config.yaml") -> "AppConfig":
@@ -114,4 +131,5 @@ class AppConfig:
             retrieval=RetrievalConfig(**raw.get("retrieval", {})),
             memory_llm=MemoryLLMConfig(**llm_raw),
             embeddings=EmbeddingsConfig(**embeddings_raw),
+            api=ApiConfig(**raw.get("api", {})),
         )

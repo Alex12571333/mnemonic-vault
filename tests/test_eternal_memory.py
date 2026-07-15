@@ -9,14 +9,19 @@ from unittest.mock import patch
 
 from app.catalog import Catalog
 from app.api import create_app
-from app.config import AppConfig, EmbeddingsConfig, MemoryLLMConfig
+from app.config import (
+    AppConfig,
+    EmbeddingsConfig,
+    MemoryLLMConfig,
+    SummarizationConfig,
+)
 from app.embeddings import OpenAICompatibleEmbedder, pack_vector
 from app.indexer import Indexer
-from app.models import Message
+from app.models import Message, Topic
 from app.recorder import SessionRecorder
 from app.retriever import ContextBuilder, Retriever
 from app.service import Services
-from app.storage import append_message, read_session, read_topic
+from app.storage import append_message, estimate_tokens, read_session, read_topic
 from app.summarizer import (
     JobRunner,
     MemorySummarizer,
@@ -45,7 +50,7 @@ class FakeEmbedder:
 
 
 class FakeMemoryLLM:
-    def summarize(self, messages, current_topics, finalizing):
+    def summarize(self, messages, current_topics, finalizing, topic_cards=None):
         source_range = [[messages[0].id, messages[-1].id]]
         if current_topics:
             existing = current_topics[0]
@@ -190,11 +195,18 @@ class EternalMemoryTest(unittest.TestCase):
             4,
             5,
         )
-        self.assertEqual(vec_hits[0], topic.id)
+        self.assertEqual(vec_hits[0]["topic_id"], topic.id)
+        self.assertGreaterEqual(vec_hits[0]["cosine_similarity"], -1.0)
         rebuilt = self.indexer.rebuild(with_embeddings=False)
         self.assertEqual(
             rebuilt,
-            {"sessions": 1, "topics": 1, "recovered_jobs": 0, "failures": 0},
+            {
+                "sessions": 1,
+                "topics": 1,
+                "messages": 4,
+                "recovered_jobs": 0,
+                "failures": 0,
+            },
         )
         lexical_retriever = Retriever(self.config, self.catalog, self.recorder)
         self.assertEqual(lexical_retriever.search("DFlash")[0].topic.id, topic.id)
@@ -303,13 +315,32 @@ class OpenAICompatibleClientsTest(unittest.TestCase):
             )
             self.assertEqual(embedder.embed(["a", "b"]), [[0.0, 1.0], [1.0, 1.0]])
             llm = OpenAICompatibleMemoryLLM(
-                MemoryLLMConfig(base_url=base_url, model="memory-test")
+                MemoryLLMConfig(base_url=base_url, model="memory-test"),
+                input_budgets=SummarizationConfig(
+                    topic_cards_budget_tokens=120,
+                    existing_summaries_budget_tokens=140,
+                    existing_summaries_top_k=1,
+                ),
+            )
+            topic = Topic(
+                id="topic-budget",
+                session_id="session-budget",
+                title="Bounded topic",
+                description="D" * 120,
+                problem="P" * 80,
+                status="active",
+                keywords=["budget"],
+                source_ranges=[],
+                created_at="2026-07-15T00:00:00+09:00",
+                updated_at="2026-07-15T00:00:00+09:00",
+                summary="S" * 4_000,
             )
             self.assertEqual(
                 llm.summarize(
                     [Message(1, "user", "test", "2026-07-15T00:00:00+09:00")],
-                    [],
+                    [topic],
                     False,
+                    topic_cards=[topic],
                 ),
                 {"operations": []},
             )
@@ -320,6 +351,16 @@ class OpenAICompatibleClientsTest(unittest.TestCase):
                 "http://models.test/v1/chat/completions",
             ],
         )
+        llm_payload = json.loads(requests[-1][1]["messages"][1]["content"])
+        self.assertLessEqual(
+            estimate_tokens(json.dumps(llm_payload["topic_cards"], ensure_ascii=False)),
+            120,
+        )
+        self.assertLessEqual(
+            estimate_tokens(json.dumps(llm_payload["current_topics"], ensure_ascii=False)),
+            140,
+        )
+        self.assertLessEqual(len(llm_payload["current_topics"]), 1)
 
 
 if __name__ == "__main__":

@@ -22,9 +22,10 @@ class VaultHttpError(RuntimeError):
 class VaultClient:
     """HTTP client deliberately kept dependency-free for Hermes plugins."""
 
-    def __init__(self, base_url: str, timeout: float = 8.0):
+    def __init__(self, base_url: str, timeout: float = 8.0, api_token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.api_token = api_token
 
     def health(self) -> dict[str, Any]:
         return self._request("/health")
@@ -46,6 +47,7 @@ class VaultClient:
         role: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        external_event_id: str | None = None,
     ) -> dict[str, Any]:
         return self._request(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/messages",
@@ -54,6 +56,7 @@ class VaultClient:
                 "role": role,
                 "content": content,
                 "metadata": metadata or {},
+                "external_event_id": external_event_id,
             },
         )
 
@@ -69,7 +72,8 @@ class VaultClient:
         query: str,
         *,
         max_topics: int = 5,
-        summary_budget_tokens: int = 1800,
+        summary_budget_tokens: int = 1500,
+        total_context_budget_tokens: int | None = None,
         include_sources: str = "auto",
     ) -> dict[str, Any]:
         return self._request(
@@ -80,6 +84,11 @@ class VaultClient:
                 "max_topics": max_topics,
                 "summary_budget_tokens": summary_budget_tokens,
                 "include_sources": include_sources,
+                **(
+                    {"total_context_budget_tokens": total_context_budget_tokens}
+                    if total_context_budget_tokens is not None
+                    else {}
+                ),
             },
         )
 
@@ -145,11 +154,14 @@ class VaultClient:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        if self.api_token:
+            headers["authorization"] = f"Bearer {self.api_token}"
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=data,
             method=method,
-            headers={"content-type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:

@@ -5,19 +5,22 @@ import json
 import logging
 import os
 import re
+import shutil
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
 from .catalog import Catalog
-from .config import AppConfig, MemoryLLMConfig
+from .config import AppConfig, MemoryLLMConfig, SummarizationConfig
 from .indexer import Indexer
+from .embeddings import cosine_similarity, unpack_vector
 from .models import Message, SourceRange, Topic, utc_or_local_now
 from .recorder import SessionRecorder
 from .storage import (
     atomic_write_json,
     estimate_tokens,
+    exclusive_lock,
     merge_ranges,
     read_json,
     read_messages,
@@ -66,32 +69,75 @@ class MemoryLLM(Protocol):
         messages: list[Message],
         current_topics: list[Topic],
         finalizing: bool,
+        topic_cards: list[Topic] | None = None,
     ) -> dict[str, Any]: ...
 
 
 class OpenAICompatibleMemoryLLM:
-    def __init__(self, config: MemoryLLMConfig, max_output_tokens: int = 2_500):
+    def __init__(
+        self,
+        config: MemoryLLMConfig,
+        max_output_tokens: int = 2_500,
+        input_budgets: SummarizationConfig | None = None,
+    ):
         self.config = config
         self.max_output_tokens = max_output_tokens
+        self.input_budgets = input_budgets or SummarizationConfig()
 
     def summarize(
         self,
         messages: list[Message],
         current_topics: list[Topic],
         finalizing: bool,
+        topic_cards: list[Topic] | None = None,
     ) -> dict[str, Any]:
         if not self.config.base_url or not self.config.model:
             raise RuntimeError("memory_llm endpoint is not configured")
-        current = [
-            {
-                **topic.card(),
-                "summary": topic.summary[:6_000],
+        cards: list[dict[str, Any]] = []
+        card_tokens = 0
+        for topic in topic_cards or current_topics:
+            card = {
+                "id": topic.id,
+                "title": topic.title,
+                "description": topic.description,
+                "problem": topic.problem,
+                "keywords": topic.keywords,
+                "status": topic.status,
             }
-            for topic in current_topics[:30]
-        ]
+            cost = estimate_tokens(json.dumps(card, ensure_ascii=False))
+            if card_tokens + cost > self.input_budgets.topic_cards_budget_tokens:
+                break
+            cards.append(card)
+            card_tokens += cost
+        current: list[dict[str, Any]] = []
+        summary_tokens = 0
+        for topic in current_topics[: self.input_budgets.existing_summaries_top_k]:
+            remaining = self.input_budgets.existing_summaries_budget_tokens - summary_tokens
+            if remaining <= 0:
+                break
+            card = {
+                "id": topic.id,
+                "title": topic.title,
+                "description": topic.description,
+                "problem": topic.problem,
+                "keywords": topic.keywords,
+                "status": topic.status,
+            }
+            card_cost = estimate_tokens(json.dumps(card, ensure_ascii=False))
+            summary_room = remaining - card_cost
+            if summary_room <= 0:
+                break
+            summary = topic.summary[: summary_room * 4]
+            item = {**card, "summary": summary}
+            cost = estimate_tokens(json.dumps(item, ensure_ascii=False))
+            if summary_tokens + cost > self.input_budgets.existing_summaries_budget_tokens:
+                break
+            current.append(item)
+            summary_tokens += cost
         incoming = [message.to_dict() for message in messages]
         user_payload = {
             "finalizing": finalizing,
+            "topic_cards": cards,
             "current_topics": current,
             "new_messages": incoming,
         }
@@ -201,34 +247,54 @@ class MemorySummarizer:
         latest_overview = ""
         for batch in self._partition(messages):
             topics = self._load_session_topics(session_path)
+            selected_topics = self._select_existing_topics(batch, topics)
             is_final_batch = batch[-1].id == session.message_count
-            response = self.llm.summarize(
-                batch,
-                topics,
-                finalizing=session.status == "finalizing" and is_final_batch,
-            )
-            applied += self._apply_operations(session_path, batch, topics, response)
-            if response.get("overview"):
-                latest_overview = str(response["overview"]).strip()
+            stage_path = self._stage_path(int(job["id"]), batch[-1].id)
+            if not (stage_path / "manifest.json").exists():
+                response = self.llm.summarize(
+                    batch,
+                    selected_topics,
+                    finalizing=session.status == "finalizing" and is_final_batch,
+                    topic_cards=topics,
+                )
+                built = self._build_operations(session_path, batch, topics, response)
+                self._write_stage(
+                    stage_path,
+                    built,
+                    str(response.get("overview", "")).strip(),
+                )
 
-            # A completed sub-batch is durable even if a later LLM call needs retrying.
-            session = read_session(session_path)
-            session.processed_until_message = batch[-1].id
-            session.summary_revision += 1
-            remaining = read_messages(
-                session_path / "transcript.jsonl",
-                session.processed_until_message + 1,
-                session.message_count,
-            )
-            session.new_token_estimate = sum(estimate_tokens(item.text) for item in remaining)
-            if (
-                session.status == "finalizing"
-                and session.processed_until_message == session.message_count
-            ):
-                session.status = "finalized"
-            write_session(session_path, session)
-            self.catalog.upsert_session(session, session_path)
-            self._write_session_index(session_path, latest_overview)
+            with exclusive_lock(session_path / ".summary.lock"):
+                staged_topics, staged_overview = self._read_stage(stage_path)
+                self._commit_topics(session_path, staged_topics)
+                applied += len(staged_topics)
+                if staged_overview:
+                    latest_overview = staged_overview
+                # Re-read under the recorder lock so a concurrent append can
+                # never be overwritten by a stale pre-LLM Session object.
+                with exclusive_lock(session_path / ".session.lock"):
+                    session = read_session(session_path)
+                    session.processed_until_message = max(
+                        session.processed_until_message, batch[-1].id
+                    )
+                    session.summary_revision += 1
+                    remaining = read_messages(
+                        session_path / "transcript.jsonl",
+                        session.processed_until_message + 1,
+                        session.message_count,
+                    )
+                    session.new_token_estimate = sum(
+                        estimate_tokens(item.text) for item in remaining
+                    )
+                    if (
+                        session.status == "finalizing"
+                        and session.processed_until_message == session.message_count
+                    ):
+                        session.status = "finalized"
+                    write_session(session_path, session)
+                    self.catalog.upsert_session(session, session_path)
+                self._write_session_index(session_path, latest_overview)
+            shutil.rmtree(stage_path, ignore_errors=True)
 
         return {
             "job_id": job["id"],
@@ -239,8 +305,14 @@ class MemorySummarizer:
         }
 
     def _partition(self, messages: list[Message]) -> list[list[Message]]:
-        # Reserve room for the system prompt and current topic summaries.
-        budget = max(1_000, int(self.config.summarization.max_input_tokens * 0.65))
+        # New turns have a separate hard budget from cards and old summaries.
+        budget = max(
+            1_000,
+            min(
+                self.config.summarization.new_messages_budget_tokens,
+                int(self.config.summarization.max_input_tokens * 0.65),
+            ),
+        )
         result: list[list[Message]] = []
         current: list[Message] = []
         used = 0
@@ -268,15 +340,15 @@ class MemorySummarizer:
             result.append(current)
         return result
 
-    def _apply_operations(
+    def _build_operations(
         self,
         session_path: Path,
         batch: list[Message],
         current_topics: list[Topic],
         response: dict[str, Any],
-    ) -> int:
+    ) -> list[Topic]:
         by_id = {topic.id: topic for topic in current_topics}
-        applied = 0
+        built: dict[str, Topic] = {}
         for raw in response.get("operations", []):
             if not isinstance(raw, dict):
                 raise ValueError("each summary operation must be an object")
@@ -340,13 +412,102 @@ class MemorySummarizer:
                     updated_at=now,
                     summary=summary,
                 )
-            topic_path = session_path / "topics" / f"{topic.id}.md"
-            topic.path = str(topic_path)
-            write_topic(topic_path, topic)
-            self.indexer.index_topic(topic_path, with_embedding=True)
+            topic.path = str(session_path / "topics" / f"{topic.id}.md")
             by_id[topic.id] = topic
-            applied += 1
-        return applied
+            built[topic.id] = topic
+        return list(built.values())
+
+    def _stage_path(self, job_id: int, last_message: int) -> Path:
+        return self.config.storage.root / "jobs" / f"job-{job_id}-{last_message}"
+
+    def _write_stage(
+        self, stage_path: Path, topics: list[Topic], overview: str
+    ) -> None:
+        topics_path = stage_path / "topics"
+        topics_path.mkdir(parents=True, exist_ok=True)
+        for topic in topics:
+            write_topic(topics_path / f"{topic.id}.md", topic)
+        # The manifest is written last and is the durable indication that all
+        # operations were validated and the stage can be replayed without LLM.
+        atomic_write_json(
+            stage_path / "manifest.json",
+            {
+                "overview": overview,
+                "topic_ids": [topic.id for topic in topics],
+            },
+        )
+
+    def _read_stage(self, stage_path: Path) -> tuple[list[Topic], str]:
+        manifest = read_json(stage_path / "manifest.json")
+        topic_ids = manifest.get("topic_ids", [])
+        if not isinstance(topic_ids, list):
+            raise ValueError("invalid staged summary manifest")
+        topics = [
+            read_topic(stage_path / "topics" / f"{validate_id(str(topic_id), 'topic id')}.md")
+            for topic_id in topic_ids
+        ]
+        return topics, str(manifest.get("overview", "")).strip()
+
+    def _commit_topics(self, session_path: Path, topics: list[Topic]) -> None:
+        indexed: list[tuple[Topic, Path]] = []
+        for topic in topics:
+            target = session_path / "topics" / f"{topic.id}.md"
+            topic.path = str(target)
+            write_topic(target, topic)
+            indexed.append((topic, target))
+        self.catalog.upsert_topics(indexed)
+        for topic in topics:
+            self.indexer.index_embedding(topic)
+
+    def _select_existing_topics(
+        self, messages: list[Message], topics: list[Topic]
+    ) -> list[Topic]:
+        if not topics:
+            return []
+        query = "\n".join(message.text for message in messages)
+        words = sorted(set(re.findall(r"[\w.+#/-]{2,}", query.lower())))[:24]
+        expression = " OR ".join(
+            f'"{word.replace(chr(34), chr(34) * 2)}"' for word in words
+        )
+        lexical_ids = [
+            str(row["id"])
+            for row in (
+                self.catalog.lexical_search(
+                    expression,
+                    self.config.summarization.existing_summaries_top_k * 3,
+                    session_id=topics[0].session_id,
+                )
+                if expression
+                else []
+            )
+        ]
+        vector_scores: list[tuple[float, str]] = []
+        if self.indexer.embedder is not None:
+            try:
+                query_vector = self.indexer.embedder.embed([query])[0]
+                for row in self.catalog.list_embeddings([topic.id for topic in topics]):
+                    if (
+                        row["model"] == self.indexer.embedder.model
+                        and int(row["dimension"]) == len(query_vector)
+                    ):
+                        vector = unpack_vector(row["embedding"], int(row["dimension"]))
+                        vector_scores.append(
+                            (cosine_similarity(query_vector, vector), str(row["topic_id"]))
+                        )
+                vector_scores.sort(reverse=True)
+            except Exception as exc:
+                logger.warning("summary topic retrieval embedding failed: %s", exc)
+        ranks: dict[str, float] = {}
+        for rank, topic_id in enumerate(lexical_ids, 1):
+            ranks[topic_id] = ranks.get(topic_id, 0.0) + 1.0 / (60 + rank)
+        for rank, (_, topic_id) in enumerate(vector_scores, 1):
+            ranks[topic_id] = ranks.get(topic_id, 0.0) + 1.0 / (60 + rank)
+        ordered = sorted(
+            topics,
+            key=lambda topic: (ranks.get(topic.id, 0.0), topic.updated_at),
+            reverse=True,
+        )
+        return ordered[: self.config.summarization.existing_summaries_top_k]
 
     def _validated_ranges(
         self, value: Any, batch: list[Message]

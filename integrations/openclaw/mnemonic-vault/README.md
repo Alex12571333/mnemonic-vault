@@ -1,6 +1,10 @@
 # Mnemonic Vault for OpenClaw
 
-Native OpenClaw memory-slot plugin. It records user/assistant turns through lifecycle hooks, injects bounded topic summaries before a turn, exposes source-expansion tools, and bundles the `mnemonic-vault-memory` skill.
+Native OpenClaw memory-slot plugin. It records user/assistant turns through
+lifecycle hooks, injects bounded topic summaries before a turn, exposes
+source-expansion tools, and bundles the `mnemonic-vault-memory` skill. Captured
+events are `fsync`ed to a persistent spool before delivery and replayed with
+stable event IDs after OpenClaw or Vault restarts.
 
 Requires OpenClaw 2026.7.1 or newer and a reachable Mnemonic Vault API.
 
@@ -15,3 +19,9 @@ openclaw config set plugins.entries.mnemonic-vault.hooks.allowConversationAccess
 openclaw gateway restart
 openclaw plugins inspect mnemonic-vault --runtime --json
 ```
+
+The default spool is `~/mnemonic-vault/data/spool/openclaw.jsonl` for an
+installed plugin. Override it with the plugin's `spoolPath` setting or set
+`MNEMONIC_VAULT_PROJECT_ROOT`. For an authenticated LAN endpoint, export
+`MNEMONIC_VAULT_API_TOKEN`; `apiTokenEnv` can point to another environment
+variable name.
