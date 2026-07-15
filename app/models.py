@@ -69,6 +69,8 @@ class Topic:
     updated_at: str
     summary: str
     path: str = ""
+    session_started_at: str = ""
+    session_ended_at: str | None = None
 
     def card(self) -> dict[str, Any]:
         return {
@@ -79,6 +81,10 @@ class Topic:
             "problem": self.problem,
             "status": self.status,
             "keywords": self.keywords,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "session_started_at": self.session_started_at,
+            "session_ended_at": self.session_ended_at,
             "path": self.path,
             "source_ranges": [
                 {
@@ -97,11 +103,28 @@ class SearchHit:
     score: float
     lexical_rank: int | None = None
     vector_rank: int | None = None
+    lexical_relevance: float = 0.0
+    vector_similarity: float | None = None
+    rrf_score: float = 0.0
+    is_latest: bool = True
+    related_older_topic_ids: list[str] = field(default_factory=list)
     source_fragments: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self, include_summary: bool = True) -> dict[str, Any]:
         value = self.topic.card()
         value["score"] = round(self.score, 6)
+        value["relevance"] = {
+            "lexical": round(self.lexical_relevance, 6),
+            "vector": (
+                round(self.vector_similarity, 6)
+                if self.vector_similarity is not None
+                else None
+            ),
+            "rrf": round(self.rrf_score, 6),
+        }
+        value["is_latest"] = self.is_latest
+        if self.related_older_topic_ids:
+            value["related_older_topic_ids"] = self.related_older_topic_ids
         if include_summary:
             value["summary"] = self.topic.summary
         if self.source_fragments:

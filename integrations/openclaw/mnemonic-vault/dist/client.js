@@ -10,10 +10,12 @@ export class VaultHttpError extends Error {
 }
 export class VaultClient {
     timeoutMs;
+    apiToken;
     fetchImpl;
     baseUrl;
-    constructor(baseUrl, timeoutMs = 8_000, fetchImpl = globalThis.fetch.bind(globalThis)) {
+    constructor(baseUrl, timeoutMs = 8_000, apiToken = "", fetchImpl = globalThis.fetch.bind(globalThis)) {
         this.timeoutMs = timeoutMs;
+        this.apiToken = apiToken;
         this.fetchImpl = fetchImpl;
         this.baseUrl = baseUrl.replace(/\/+$/, "");
     }
@@ -36,10 +38,15 @@ export class VaultClient {
             throw error;
         }
     }
-    async appendMessage(sessionId, role, content, metadata = {}) {
+    async appendMessage(sessionId, role, content, metadata = {}, externalEventId) {
         return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: "POST",
-            body: JSON.stringify({ role, content, metadata }),
+            body: JSON.stringify({
+                role,
+                content,
+                metadata,
+                external_event_id: externalEventId,
+            }),
         });
     }
     async endSession(sessionId) {
@@ -54,7 +61,10 @@ export class VaultClient {
             body: JSON.stringify({
                 query,
                 max_topics: options.maxTopics ?? 5,
-                summary_budget_tokens: options.summaryBudgetTokens ?? 1_800,
+                summary_budget_tokens: options.summaryBudgetTokens ?? 1_500,
+                ...(options.totalContextBudgetTokens === undefined
+                    ? {}
+                    : { total_context_budget_tokens: options.totalContextBudgetTokens }),
                 include_sources: options.includeSources ?? "auto",
             }),
         });
@@ -91,12 +101,13 @@ export class VaultClient {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
         try {
+            const headers = new Headers(init.headers);
+            headers.set("content-type", "application/json");
+            if (this.apiToken)
+                headers.set("authorization", `Bearer ${this.apiToken}`);
             const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
                 ...init,
-                headers: {
-                    "content-type": "application/json",
-                    ...(init.headers ?? {}),
-                },
+                headers,
                 signal: controller.signal,
             });
             const body = await response.text();

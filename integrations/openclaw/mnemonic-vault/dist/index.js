@@ -1,16 +1,24 @@
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { buildJsonPluginConfigSchema, definePluginEntry, } from "openclaw/plugin-sdk/plugin-entry";
 import { extractLastAssistant, formatMemoryContext, VaultClient, vaultSessionId, } from "./client.js";
+import { DurableSpool } from "./spool.js";
 const DEFAULTS = {
     baseUrl: "http://127.0.0.1:8765",
     agent: "openclaw",
     autoCapture: true,
     autoRecall: true,
     maxTopics: 5,
-    summaryBudgetTokens: 1_800,
+    summaryBudgetTokens: 1_500,
     includeSources: "auto",
     requestTimeoutMs: 8_000,
+    spoolPath: "",
+    spoolFlushMs: 2_000,
+    apiTokenEnv: "MNEMONIC_VAULT_API_TOKEN",
 };
 const configSchema = buildJsonPluginConfigSchema({
     type: "object",
@@ -24,6 +32,9 @@ const configSchema = buildJsonPluginConfigSchema({
         summaryBudgetTokens: { type: "integer", minimum: 100, maximum: 32_000 },
         includeSources: { type: "string", enum: ["auto", "always", "never"] },
         requestTimeoutMs: { type: "integer", minimum: 250, maximum: 60_000 },
+        spoolPath: { type: "string" },
+        spoolFlushMs: { type: "integer", minimum: 250, maximum: 60_000 },
+        apiTokenEnv: { type: "string" },
     },
 });
 function resolveConfig(value) {
@@ -39,6 +50,9 @@ function resolveConfig(value) {
             ? raw.includeSources
             : "auto",
         requestTimeoutMs: finiteInt(raw.requestTimeoutMs, DEFAULTS.requestTimeoutMs),
+        spoolPath: typeof raw.spoolPath === "string" ? raw.spoolPath : DEFAULTS.spoolPath,
+        spoolFlushMs: finiteInt(raw.spoolFlushMs, DEFAULTS.spoolFlushMs),
+        apiTokenEnv: typeof raw.apiTokenEnv === "string" ? raw.apiTokenEnv : DEFAULTS.apiTokenEnv,
     };
 }
 function finiteInt(value, fallback) {
@@ -64,26 +78,58 @@ export default definePluginEntry({
     register(api) {
         const rawConfig = api.pluginConfig;
         const config = resolveConfig(rawConfig);
-        const client = new VaultClient(config.baseUrl, config.requestTimeoutMs);
+        const client = new VaultClient(config.baseUrl, config.requestTimeoutMs, process.env[config.apiTokenEnv] ?? "");
         const instanceId = `${Date.now().toString(36)}-${process.pid.toString(36)}`;
         const sessions = new Map();
         const captured = new Set();
+        const sourceRoot = fileURLToPath(new URL("../../../../", import.meta.url));
+        const projectRoot = process.env.MNEMONIC_VAULT_PROJECT_ROOT ??
+            (existsSync(join(sourceRoot, "run.py")) ? sourceRoot : join(homedir(), "mnemonic-vault"));
+        const spool = config.autoCapture
+            ? new DurableSpool(config.spoolPath || join(projectRoot, "data", "spool", "openclaw.jsonl"))
+            : undefined;
         const externalSession = (value) => value.sessionKey ?? value.sessionId ?? `run-${value.runId ?? "main"}`;
-        const ensureSession = async (externalId) => {
+        const vaultSession = (externalId) => {
             const existing = sessions.get(externalId);
             if (existing)
                 return existing;
             const vaultId = vaultSessionId(externalId, config.agent, instanceId);
-            const pending = client
-                .startSession(vaultId, config.agent, externalId)
-                .then(() => vaultId)
-                .catch((error) => {
-                sessions.delete(externalId);
-                throw error;
-            });
-            sessions.set(externalId, pending);
-            return pending;
+            sessions.set(externalId, vaultId);
+            return vaultId;
         };
+        let flushing;
+        const flushSpool = async () => {
+            if (!spool)
+                return;
+            for (const event of spool.pending()) {
+                try {
+                    await client.startSession(event.session_id, event.agent, event.external_session_id);
+                    if (event.kind === "message") {
+                        await client.appendMessage(event.session_id, event.role ?? "unknown", event.content ?? "", event.metadata ?? {}, event.event_id);
+                    }
+                    else {
+                        await client.endSession(event.session_id);
+                    }
+                    spool.acknowledge(event.event_id);
+                }
+                catch (error) {
+                    api.logger.warn(`Mnemonic Vault spool delivery failed; will retry: ${String(error)}`);
+                    break;
+                }
+            }
+        };
+        const scheduleFlush = () => {
+            if (!spool || flushing)
+                return;
+            flushing = flushSpool().finally(() => {
+                flushing = undefined;
+            });
+        };
+        if (spool) {
+            scheduleFlush();
+            const timer = setInterval(scheduleFlush, config.spoolFlushMs);
+            timer.unref();
+        }
         const markCaptured = (key) => {
             if (captured.has(key))
                 return false;
@@ -104,6 +150,7 @@ export default definePluginEntry({
                 query: Type.String(),
                 max_topics: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
                 summary_budget_tokens: Type.Optional(Type.Integer({ minimum: 100, maximum: 32_000 })),
+                total_context_budget_tokens: Type.Optional(Type.Integer({ minimum: 100, maximum: 32_000 })),
                 include_sources: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("always"), Type.Literal("never")])),
             }),
             async execute(_id, rawParams) {
@@ -112,6 +159,7 @@ export default definePluginEntry({
                     return toolResult(await client.search(params.query, {
                         maxTopics: params.max_topics,
                         summaryBudgetTokens: params.summary_budget_tokens,
+                        totalContextBudgetTokens: params.total_context_budget_tokens,
                         includeSources: params.include_sources,
                     }));
                 }
@@ -199,29 +247,29 @@ export default definePluginEntry({
         api.on("session_start", async (event, ctx) => {
             if (!config.autoCapture)
                 return;
-            try {
-                await ensureSession(externalSession({ ...event, ...ctx }));
-            }
-            catch (error) {
-                api.logger.warn(`Mnemonic Vault session start failed: ${String(error)}`);
-            }
+            vaultSession(externalSession({ ...event, ...ctx }));
+            scheduleFlush();
         });
         api.on("before_prompt_build", async (event, ctx) => {
             const externalId = externalSession(ctx);
             if (config.autoCapture && event.prompt.trim()) {
                 const key = captureKey("user", externalId, ctx.runId, event.prompt);
                 if (markCaptured(key)) {
-                    try {
-                        const vaultId = await ensureSession(externalId);
-                        await client.appendMessage(vaultId, "user", event.prompt, {
+                    const vaultId = vaultSession(externalId);
+                    spool.append({
+                        kind: "message",
+                        session_id: vaultId,
+                        external_session_id: externalId,
+                        agent: config.agent,
+                        role: "user",
+                        content: event.prompt,
+                        metadata: {
                             source: "openclaw-plugin",
                             external_session_id: externalId,
                             run_id: ctx.runId ?? "",
-                        });
-                    }
-                    catch (error) {
-                        api.logger.warn(`Mnemonic Vault user capture failed: ${String(error)}`);
-                    }
+                        },
+                    });
+                    scheduleFlush();
                 }
             }
             if (!config.autoRecall || !event.prompt.trim())
@@ -250,32 +298,35 @@ export default definePluginEntry({
             const key = captureKey("assistant", externalId, event.runId ?? ctx.runId, content);
             if (!markCaptured(key))
                 return;
-            try {
-                const vaultId = await ensureSession(externalId);
-                await client.appendMessage(vaultId, "assistant", content, {
+            const vaultId = vaultSession(externalId);
+            spool.append({
+                kind: "message",
+                session_id: vaultId,
+                external_session_id: externalId,
+                agent: config.agent,
+                role: "assistant",
+                content,
+                metadata: {
                     source: "openclaw-plugin",
                     external_session_id: externalId,
                     run_id: event.runId ?? ctx.runId ?? "",
-                });
-            }
-            catch (error) {
-                api.logger.warn(`Mnemonic Vault assistant capture failed: ${String(error)}`);
-            }
+                },
+            });
+            scheduleFlush();
         });
         api.on("session_end", async (event, ctx) => {
             if (!config.autoCapture)
                 return;
             const externalId = externalSession({ ...event, ...ctx });
-            const pending = sessions.get(externalId);
-            if (!pending)
-                return;
-            try {
-                await client.endSession(await pending);
-                sessions.delete(externalId);
-            }
-            catch (error) {
-                api.logger.warn(`Mnemonic Vault session end failed: ${String(error)}`);
-            }
+            const vaultId = vaultSession(externalId);
+            spool.append({
+                kind: "end",
+                session_id: vaultId,
+                external_session_id: externalId,
+                agent: config.agent,
+            });
+            sessions.delete(externalId);
+            scheduleFlush();
         });
     },
 });

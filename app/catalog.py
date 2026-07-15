@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from .models import Session, Topic
+from .models import Message, Session, Topic
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS topic_embeddings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS messages (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    external_event_id TEXT,
+    PRIMARY KEY (session_id, message_id),
+    UNIQUE (session_id, external_event_id)
+);
+
 CREATE TABLE IF NOT EXISTS vector_index_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     model TEXT NOT NULL,
@@ -87,8 +98,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts USING fts5(
     tokenize='unicode61 remove_diacritics 2'
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    session_id UNINDEXED,
+    message_id UNINDEXED,
+    role UNINDEXED,
+    content,
+    created_at UNINDEXED,
+    tokenize='unicode61 remove_diacritics 2'
+);
+
 CREATE INDEX IF NOT EXISTS topics_session_idx ON topics(session_id);
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS messages_external_event_idx
+    ON messages(session_id, external_event_id);
 """
 
 
@@ -197,62 +219,146 @@ class Catalog:
         return self._resolve_path(row["path"]) if row else None
 
     def upsert_topic(self, topic: Topic, path: str | Path) -> None:
+        with self.transaction(immediate=True) as connection:
+            self._upsert_topic(connection, topic, path)
+
+    def upsert_topics(self, topics: Sequence[tuple[Topic, str | Path]]) -> None:
+        """Update topic catalog rows and FTS entries in one SQLite transaction."""
+        with self.transaction(immediate=True) as connection:
+            for topic, path in topics:
+                self._upsert_topic(connection, topic, path)
+
+    def _upsert_topic(
+        self, connection: sqlite3.Connection, topic: Topic, path: str | Path
+    ) -> None:
         stored_path = self._store_path(path)
         keywords = json.dumps(topic.keywords, ensure_ascii=False)
+        connection.execute(
+            """
+            INSERT INTO topics (
+                id, session_id, path, title, description, problem, keywords,
+                summary, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                session_id=excluded.session_id, path=excluded.path,
+                title=excluded.title, description=excluded.description,
+                problem=excluded.problem, keywords=excluded.keywords,
+                summary=excluded.summary, status=excluded.status,
+                created_at=excluded.created_at, updated_at=excluded.updated_at
+            """,
+            (
+                topic.id,
+                topic.session_id,
+                stored_path,
+                topic.title,
+                topic.description,
+                topic.problem,
+                keywords,
+                topic.summary,
+                topic.status,
+                topic.created_at,
+                topic.updated_at,
+            ),
+        )
+        connection.execute("DELETE FROM topic_sources WHERE topic_id = ?", (topic.id,))
+        connection.executemany(
+            """
+            INSERT INTO topic_sources(topic_id, session_id, from_message, to_message)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (topic.id, item.session_id, item.from_message, item.to_message)
+                for item in topic.source_ranges
+            ],
+        )
+        connection.execute("DELETE FROM topics_fts WHERE topic_id = ?", (topic.id,))
+        connection.execute(
+            """
+            INSERT INTO topics_fts(topic_id, title, description, problem, keywords, summary)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                topic.id,
+                topic.title,
+                topic.description,
+                topic.problem,
+                " ".join(topic.keywords),
+                topic.summary,
+            ),
+        )
+
+    def index_message(
+        self,
+        session_id: str,
+        message: Message,
+        external_event_id: str | None = None,
+    ) -> None:
+        """Index one durable transcript message; files remain the source of truth."""
         with self.transaction(immediate=True) as connection:
             connection.execute(
                 """
-                INSERT INTO topics (
-                    id, session_id, path, title, description, problem, keywords,
-                    summary, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    session_id=excluded.session_id, path=excluded.path,
-                    title=excluded.title, description=excluded.description,
-                    problem=excluded.problem, keywords=excluded.keywords,
-                    summary=excluded.summary, status=excluded.status,
-                    created_at=excluded.created_at, updated_at=excluded.updated_at
+                INSERT INTO messages(
+                    session_id, message_id, role, content, created_at, external_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, message_id) DO UPDATE SET
+                    role=excluded.role, content=excluded.content,
+                    created_at=excluded.created_at,
+                    external_event_id=COALESCE(excluded.external_event_id, messages.external_event_id)
                 """,
                 (
-                    topic.id,
-                    topic.session_id,
-                    stored_path,
-                    topic.title,
-                    topic.description,
-                    topic.problem,
-                    keywords,
-                    topic.summary,
-                    topic.status,
-                    topic.created_at,
-                    topic.updated_at,
+                    session_id,
+                    message.id,
+                    message.role,
+                    message.text,
+                    message.created_at,
+                    external_event_id,
                 ),
             )
-            connection.execute("DELETE FROM topic_sources WHERE topic_id = ?", (topic.id,))
-            connection.executemany(
-                """
-                INSERT INTO topic_sources(topic_id, session_id, from_message, to_message)
-                VALUES (?, ?, ?, ?)
-                """,
-                [
-                    (topic.id, item.session_id, item.from_message, item.to_message)
-                    for item in topic.source_ranges
-                ],
+            connection.execute(
+                "DELETE FROM messages_fts WHERE session_id = ? AND message_id = ?",
+                (session_id, message.id),
             )
-            connection.execute("DELETE FROM topics_fts WHERE topic_id = ?", (topic.id,))
             connection.execute(
                 """
-                INSERT INTO topics_fts(topic_id, title, description, problem, keywords, summary)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO messages_fts(session_id, message_id, role, content, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (
-                    topic.id,
-                    topic.title,
-                    topic.description,
-                    topic.problem,
-                    " ".join(topic.keywords),
-                    topic.summary,
-                ),
+                (session_id, message.id, message.role, message.text, message.created_at),
             )
+
+    def message_by_external_event(
+        self, session_id: str, external_event_id: str
+    ) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM messages
+                WHERE session_id = ? AND external_event_id = ?
+                """,
+                (session_id, external_event_id),
+            ).fetchone()
+
+    def search_messages(
+        self, fts_query: str, limit: int, session_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            where_session = " AND session_id = ?" if session_id else ""
+            parameters: tuple[object, ...] = (
+                (fts_query, session_id, limit)
+                if session_id
+                else (fts_query, limit)
+            )
+            return connection.execute(
+                f"""
+                SELECT session_id, message_id, role, content, created_at,
+                       bm25(messages_fts, 0.0, 0.0, 0.0, 1.0, 0.0) AS bm25_score
+                FROM messages_fts
+                WHERE messages_fts MATCH ?{where_session}
+                ORDER BY bm25_score
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
 
     def delete_all_index_data(self) -> None:
         with self.transaction(immediate=True) as connection:
@@ -260,6 +366,8 @@ class Catalog:
                 connection.execute("DROP TABLE IF EXISTS topic_vec")
             connection.execute("DELETE FROM vector_index_meta")
             connection.execute("DELETE FROM topics_fts")
+            connection.execute("DELETE FROM messages_fts")
+            connection.execute("DELETE FROM messages")
             connection.execute("DELETE FROM topic_embeddings")
             connection.execute("DELETE FROM topic_sources")
             connection.execute("DELETE FROM topics")
@@ -311,18 +419,26 @@ class Catalog:
                 "SELECT * FROM topics ORDER BY updated_at DESC"
             ).fetchall()
 
-    def lexical_search(self, fts_query: str, limit: int) -> list[sqlite3.Row]:
+    def lexical_search(
+        self, fts_query: str, limit: int, session_id: str | None = None
+    ) -> list[sqlite3.Row]:
         with self.connection() as connection:
+            session_filter = " AND t.session_id = ?" if session_id else ""
+            parameters: tuple[object, ...] = (
+                (fts_query, session_id, limit)
+                if session_id
+                else (fts_query, limit)
+            )
             return connection.execute(
-                """
+                f"""
                 SELECT t.*, bm25(topics_fts, 0.0, 5.0, 3.0, 3.0, 2.0, 1.0) AS bm25_score
                 FROM topics_fts
                 JOIN topics AS t ON t.id = topics_fts.topic_id
-                WHERE topics_fts MATCH ?
+                WHERE topics_fts MATCH ?{session_filter}
                 ORDER BY bm25_score
                 LIMIT ?
                 """,
-                (fts_query, limit),
+                parameters,
             ).fetchall()
 
     def enqueue_job(
@@ -392,6 +508,26 @@ class Catalog:
                 (status, error[-4000:], now, job_id),
             )
 
+    def retry_failed_jobs(self, now: str, session_id: str | None = None) -> int:
+        with self.connection() as connection:
+            if session_id:
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs SET status='pending', attempts=0, error=NULL, updated_at=?
+                    WHERE status='failed' AND session_id=?
+                    """,
+                    (now, session_id),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs SET status='pending', attempts=0, error=NULL, updated_at=?
+                    WHERE status='failed'
+                    """,
+                    (now,),
+                )
+            return cursor.rowcount
+
     def list_embeddings(self, topic_ids: Sequence[str] | None = None) -> list[sqlite3.Row]:
         with self.connection() as connection:
             if topic_ids:
@@ -428,7 +564,7 @@ class Catalog:
 
     def vector_search(
         self, model: str, query_vector: bytes, dimension: int, limit: int
-    ) -> list[str]:
+    ) -> list[dict[str, float | str]]:
         try:
             with self.connection() as connection:
                 if not self._has_vec(connection) or not self._table_exists(
@@ -453,7 +589,13 @@ class Catalog:
                     """,
                     (query_vector, limit),
                 ).fetchall()
-                return [str(row["topic_id"]) for row in rows]
+                return [
+                    {
+                        "topic_id": str(row["topic_id"]),
+                        "cosine_similarity": max(-1.0, min(1.0, 1.0 - float(row["distance"]))),
+                    }
+                    for row in rows
+                ]
         except sqlite3.Error as exc:
             logger.warning("sqlite-vec search failed, using exact fallback: %s", exc)
             return []

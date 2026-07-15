@@ -77,38 +77,92 @@ class SessionRecorder:
         content: str,
         created_at: str | None = None,
         metadata: dict[str, Any] | None = None,
+        external_event_id: str | None = None,
     ) -> Message:
         if not role or not content:
             raise ValueError("role and content must be non-empty")
+        if external_event_id:
+            external_event_id = validate_id(external_event_id, "external event id")
         path = self.locate(session_id)
         with exclusive_lock(path / ".session.lock"):
             session = read_session(path)
+            recovered = self._recover_tail(session_id, path, session)
+            if external_event_id:
+                existing = self._find_external_event(
+                    session_id, path, external_event_id
+                )
+                if existing is not None:
+                    if existing.role != role or existing.text != content:
+                        raise ValueError(
+                            "external_event_id is already bound to different content"
+                        )
+                    if recovered:
+                        write_session(path, session)
+                        self.catalog.upsert_session(session, path)
+                        self._schedule_if_needed(session)
+                    return existing
             if session.status != "active":
                 raise RuntimeError(f"cannot append to {session.status} session")
-            tail = read_last_message(path / "transcript.jsonl")
-            if tail is not None and tail.id > session.message_count:
-                recovered = read_messages(
-                    path / "transcript.jsonl", session.message_count + 1, tail.id
-                )
-                session.message_count = tail.id
-                session.new_token_estimate += sum(
-                    estimate_tokens(item.text) for item in recovered
-                )
+            message_metadata = dict(metadata or {})
+            if external_event_id:
+                message_metadata["external_event_id"] = external_event_id
             message = Message(
                 id=session.message_count + 1,
                 role=role,
                 text=content,
                 created_at=created_at or utc_or_local_now(),
-                metadata=metadata or {},
+                metadata=message_metadata,
             )
             # The append and fsync happen before any derived metadata is changed.
             append_message(path / "transcript.jsonl", message)
+            self.catalog.index_message(session_id, message, external_event_id)
             session.message_count = message.id
             session.new_token_estimate += estimate_tokens(content)
             write_session(path, session)
             self.catalog.upsert_session(session, path)
             self._schedule_if_needed(session)
             return message
+
+    def _recover_tail(
+        self, session_id: str, path: Path, session: Session
+    ) -> list[Message]:
+        tail = read_last_message(path / "transcript.jsonl")
+        if tail is None or tail.id <= session.message_count:
+            return []
+        recovered = read_messages(
+            path / "transcript.jsonl", session.message_count + 1, tail.id
+        )
+        session.message_count = tail.id
+        session.new_token_estimate += sum(
+            estimate_tokens(item.text) for item in recovered
+        )
+        for recovered_message in recovered:
+            self.catalog.index_message(
+                session_id,
+                recovered_message,
+                str(recovered_message.metadata.get("external_event_id") or "") or None,
+            )
+        return recovered
+
+    def _find_external_event(
+        self, session_id: str, path: Path, external_event_id: str
+    ) -> Message | None:
+        row = self.catalog.message_by_external_event(session_id, external_event_id)
+        if row is not None:
+            return Message(
+                id=int(row["message_id"]),
+                role=str(row["role"]),
+                text=str(row["content"]),
+                created_at=str(row["created_at"]),
+                metadata={"external_event_id": external_event_id},
+            )
+        # This slow path is used only when transcript fsync succeeded but the
+        # recoverable SQLite index update did not, or after catalog loss.
+        for message in read_messages(path / "transcript.jsonl"):
+            if message.metadata.get("external_event_id") == external_event_id:
+                self.catalog.index_message(session_id, message, external_event_id)
+                return message
+        return None
 
     def end_session(self, session_id: str, ended_at: str | None = None) -> Session:
         path = self.locate(session_id)

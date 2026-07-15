@@ -3,12 +3,22 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import ipaddress
 from pathlib import Path
 
 from app.config import AppConfig
 from app.models import utc_or_local_now
+from app.evaluation import evaluate_retrieval
 from app.service import build_services
-from app.storage import atomic_write_json, estimate_tokens, read_messages, read_session, write_session
+from app.storage import (
+    atomic_write_json,
+    estimate_tokens,
+    exclusive_lock,
+    read_messages,
+    read_session,
+    write_session,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -32,6 +42,17 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser("reembed-all", help="rebuild all topic embeddings")
 
+    retry_failed = commands.add_parser(
+        "retry-failed", help="return failed summary jobs to the pending queue"
+    )
+    retry_failed.add_argument("--session")
+
+    evaluate = commands.add_parser(
+        "evaluate-retrieval", help="measure recall@k and negative rejection on JSONL"
+    )
+    evaluate.add_argument("--dataset", required=True)
+    evaluate.add_argument("--top-k", type=int, default=5)
+
     resummarize = commands.add_parser(
         "resummarize", help="recreate derived topic summaries for one session"
     )
@@ -54,6 +75,8 @@ def main() -> int:
             from app.api import create_app
         except ImportError as exc:
             raise SystemExit("Install requirements.txt before running the API") from exc
+        config = AppConfig.load(args.config)
+        validate_bind_security(args.host, config)
         uvicorn.run(
             create_app(args.config),
             host=args.host,
@@ -69,6 +92,19 @@ def main() -> int:
         return 0
     if args.command == "reembed-all":
         print(json.dumps(services.indexer.reembed_all(), ensure_ascii=False))
+        return 0
+    if args.command == "retry-failed":
+        count = services.catalog.retry_failed_jobs(
+            utc_or_local_now(), args.session
+        )
+        print(json.dumps({"retried_jobs": count}, ensure_ascii=False))
+        return 0
+    if args.command == "evaluate-retrieval":
+        print(json.dumps(
+            evaluate_retrieval(services.retriever, args.dataset, args.top_k),
+            ensure_ascii=False,
+            indent=2,
+        ))
         return 0
     if args.command == "process-jobs":
         services.job_runner.recover()
@@ -92,29 +128,48 @@ def main() -> int:
     return 2
 
 
+def validate_bind_security(host: str, config: AppConfig) -> None:
+    """Refuse network exposure unless bearer authentication is configured."""
+    loopback_names = {"localhost", "ip6-localhost"}
+    is_loopback = host.lower() in loopback_names
+    if not is_loopback:
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = False
+    token = os.environ.get(config.api.bearer_token_env, "")
+    if not is_loopback and not token:
+        raise SystemExit(
+            f"Refusing to bind {host} without {config.api.bearer_token_env}; "
+            "set a bearer token or use 127.0.0.1"
+        )
+
+
 def prepare_resummarize(services, session_id: str) -> None:
     path = services.recorder.locate(session_id)
-    session = read_session(path)
-    services.catalog.delete_session_jobs(session_id)
-    services.catalog.delete_session_topics(session_id)
-    for topic_path in (path / "topics").glob("*.md"):
-        topic_path.unlink()
-    session.processed_until_message = 0
-    session.new_token_estimate = sum(
-        estimate_tokens(message.text)
-        for message in read_messages(path / "transcript.jsonl")
-    )
-    session.status = "finalizing" if session.ended_at else "active"
-    write_session(path, session)
-    atomic_write_json(
-        path / "index.json",
-        {"session_id": session.id, "overview": "", "topics": []},
-    )
-    services.catalog.upsert_session(session, path)
-    if session.message_count:
-        services.catalog.enqueue_job(
-            session.id, 1, session.message_count, utc_or_local_now()
-        )
+    with exclusive_lock(path / ".summary.lock"):
+        with exclusive_lock(path / ".session.lock"):
+            session = read_session(path)
+            services.catalog.delete_session_jobs(session_id)
+            services.catalog.delete_session_topics(session_id)
+            for topic_path in (path / "topics").glob("*.md"):
+                topic_path.unlink()
+            session.processed_until_message = 0
+            session.new_token_estimate = sum(
+                estimate_tokens(message.text)
+                for message in read_messages(path / "transcript.jsonl")
+            )
+            session.status = "finalizing" if session.ended_at else "active"
+            write_session(path, session)
+            atomic_write_json(
+                path / "index.json",
+                {"session_id": session.id, "overview": "", "topics": []},
+            )
+            services.catalog.upsert_session(session, path)
+            if session.message_count:
+                services.catalog.enqueue_job(
+                    session.id, 1, session.message_count, utc_or_local_now()
+                )
 
 
 if __name__ == "__main__":

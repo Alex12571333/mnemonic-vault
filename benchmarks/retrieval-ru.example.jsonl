@@ -1,0 +1,6 @@
+# Replace relevant_topic_ids with IDs from your own catalog before evaluation.
+{"kind":"exact","query":"Какой фикс использовали для DFlash?","relevant_topic_ids":["topic-dgx-spark"]}
+{"kind":"ru-paraphrase","query":"Что помогло починить Flash Attention на Спарке?","relevant_topic_ids":["topic-dgx-spark"]}
+{"kind":"en-to-ru","query":"Which launch flag fixed the CUDA graph error?","relevant_topic_ids":["topic-dgx-spark"]}
+{"kind":"short","query":"DFlash фикс","relevant_topic_ids":["topic-dgx-spark"]}
+{"kind":"negative","query":"Как приготовить лимонный пирог?","relevant_topic_ids":[]}
