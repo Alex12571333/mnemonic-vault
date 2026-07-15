@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import entry from "./index.js";
-import { formatMemoryContext, vaultSessionId } from "./client.js";
+import entry, { flushDurableSpool } from "./index.js";
+import {
+  formatMemoryContext,
+  VaultHttpError,
+  vaultSessionId,
+} from "./client.js";
 import { DurableSpool } from "./spool.js";
 
 describe("mnemonic-vault OpenClaw plugin", () => {
@@ -41,9 +45,26 @@ describe("mnemonic-vault OpenClaw plugin", () => {
   });
 
   it("creates stable safe vault session identifiers", () => {
-    const value = vaultSessionId("agent:main:telegram:direct:42", "openclaw", "test");
+    const value = vaultSessionId(
+      "agent:main:telegram:direct:42",
+      "openclaw",
+      "openclaw-main",
+    );
     expect(value).toMatch(/^session-openclaw-[a-f0-9]{24}$/);
-    expect(vaultSessionId("agent:main:telegram:direct:42", "openclaw", "test")).toBe(value);
+    expect(
+      vaultSessionId(
+        "agent:main:telegram:direct:42",
+        "openclaw",
+        "openclaw-main",
+      ),
+    ).toBe(value);
+    expect(
+      vaultSessionId(
+        "agent:main:telegram:direct:42",
+        "openclaw",
+        "openclaw-secondary",
+      ),
+    ).not.toBe(value);
   });
 
   it("renders bounded memory as untrusted reference context", () => {
@@ -93,6 +114,139 @@ describe("mnemonic-vault OpenClaw plugin", () => {
       ]);
       recovered.compact();
       expect(new DurableSpool(path).pending()).toHaveLength(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("dead-letters a permanent poison event and continues in order", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mnemonic-vault-poison-"));
+    try {
+      const spool = new DurableSpool(join(directory, "openclaw.jsonl"));
+      spool.append({
+        kind: "message",
+        session_id: "session-a",
+        external_session_id: "external-a",
+        agent: "openclaw",
+        role: "user",
+        content: "poison",
+      });
+      spool.append({
+        kind: "message",
+        session_id: "session-a",
+        external_session_id: "external-a",
+        agent: "openclaw",
+        role: "assistant",
+        content: "valid next",
+      });
+      const delivered: string[] = [];
+      const client = {
+        async startSession() {},
+        async appendMessage(_session: string, _role: string, content: string) {
+          if (content === "poison") throw new VaultHttpError(413, "too large");
+          delivered.push(content);
+          return {};
+        },
+        async endSession() { return {}; },
+      };
+      const result = await flushDurableSpool(spool, client, { warn() {} });
+      expect(result).toBe("drained");
+      expect(spool.pending()).toEqual([]);
+      expect(delivered).toEqual(["valid next"]);
+      expect(spool.deadLetters()[0]?.status).toBe(413);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("quarantines a corrupt complete spool record without blocking later data", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mnemonic-vault-corrupt-"));
+    try {
+      const path = join(directory, "openclaw.jsonl");
+      const spool = new DurableSpool(path);
+      writeFileSync(path, "{corrupt json\n", "utf8");
+      spool.append({
+        kind: "message",
+        session_id: "session-a",
+        external_session_id: "external-a",
+        agent: "openclaw",
+        role: "user",
+        content: "valid after corruption",
+      });
+      const delivered: string[] = [];
+      const client = {
+        async startSession() {},
+        async appendMessage(_session: string, _role: string, content: string) {
+          delivered.push(content);
+          return {};
+        },
+        async endSession() { return {}; },
+      };
+      expect(await flushDurableSpool(spool, client, { warn() {} })).toBe("drained");
+      expect(delivered).toEqual(["valid after corruption"]);
+      expect(spool.deadLetters()[0]?.event.metadata?.raw_record).toBe("{corrupt json");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an authentication failure pending and blocks the worker", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mnemonic-vault-auth-"));
+    try {
+      const spool = new DurableSpool(join(directory, "openclaw.jsonl"));
+      spool.append({
+        kind: "message",
+        session_id: "session-a",
+        external_session_id: "external-a",
+        agent: "openclaw",
+        role: "user",
+        content: "protected",
+      });
+      const client = {
+        async startSession() { throw new VaultHttpError(401, "unauthorized"); },
+        async appendMessage() { return {}; },
+        async endSession() { return {}; },
+      };
+      expect(await flushDurableSpool(spool, client, { warn() {} })).toBe("blocked");
+      expect(spool.pending()).toHaveLength(1);
+      expect(spool.deadLetters()).toEqual([]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers an append aimed at a finalized session", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mnemonic-vault-recovery-"));
+    try {
+      const spool = new DurableSpool(join(directory, "openclaw.jsonl"));
+      spool.append({
+        kind: "message",
+        session_id: "session-finalized",
+        external_session_id: "external-a",
+        agent: "openclaw",
+        role: "user",
+        content: "recover me",
+      });
+      const delivered: Array<{ session: string; metadata: Record<string, unknown> }> = [];
+      const client = {
+        async startSession() {},
+        async appendMessage(
+          session: string,
+          _role: string,
+          _content: string,
+          metadata: Record<string, unknown>,
+        ) {
+          if (!session.startsWith("session-recovery-")) {
+            throw new VaultHttpError(409, "finalized");
+          }
+          delivered.push({ session, metadata });
+          return {};
+        },
+        async endSession() { return {}; },
+      };
+      expect(await flushDurableSpool(spool, client, { warn() {} })).toBe("drained");
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]?.metadata.recovered_from_session).toBe("session-finalized");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

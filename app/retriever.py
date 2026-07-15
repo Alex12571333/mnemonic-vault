@@ -33,6 +33,11 @@ PRECISION_QUERY = re.compile(
     r"токен\w*|сколько|command\w*|exact\w*|parameter\w*|error\w*|version\w*)\b",
     re.IGNORECASE,
 )
+HISTORICAL_QUERY = re.compile(
+    r"(?:\b(?:19|20)\d{2}\b|раньше|тогда|до\s+перехода|первоначальн|"
+    r"предыдущ|прежн|previously|before|back\s+then|originally|at\s+the\s+time)",
+    re.IGNORECASE,
+)
 
 
 def tokenize_query(query: str) -> list[str]:
@@ -138,7 +143,11 @@ class Retriever:
                     rrf_score=raw_scores[topic_id],
                 )
             )
-        return self._diversify(candidates, max_topics or retrieval.final_top_k)
+        return self._diversify(
+            candidates,
+            max_topics or retrieval.final_top_k,
+            preserve_history=bool(HISTORICAL_QUERY.search(query)),
+        )
 
     def get_topic(self, topic_id: str) -> Topic:
         validate_id(topic_id, "topic id")
@@ -156,7 +165,14 @@ class Retriever:
             topic.session_started_at = str(row["started_at"] or "")
             topic.session_ended_at = str(row["ended_at"]) if row["ended_at"] else None
 
-    def _diversify(self, candidates: list[SearchHit], limit: int) -> list[SearchHit]:
+    def _diversify(
+        self,
+        candidates: list[SearchHit],
+        limit: int,
+        preserve_history: bool = False,
+    ) -> list[SearchHit]:
+        if preserve_history:
+            return candidates[:limit]
         groups: list[SearchHit] = []
         for candidate in candidates:
             candidate_tokens = set(
@@ -401,7 +417,7 @@ def compact_hit_card(hit: SearchHit, token_budget: int) -> dict[str, Any]:
         if cost() <= token_budget:
             break
         value = str(item.get(field, ""))
-        overflow_chars = max(16, (cost() - token_budget) * 4 + 16)
+        overflow_chars = max(16, int((cost() - token_budget) * 2.5) + 16)
         keep = max(0, len(value) - overflow_chars)
         item[field] = value[:keep] + ("…" if keep else "")
     return item if cost() <= token_budget else {}
@@ -465,7 +481,7 @@ def rank_messages(
             marker_cost = estimate_tokens(marker)
             if token_budget <= marker_cost:
                 return []
-            allowed = max(1, (token_budget - marker_cost) * 4)
+            allowed = max(1, int((token_budget - marker_cost) * 2.5))
             text = text[:allowed] + marker
             cost = estimate_tokens(text)
             while cost > token_budget and allowed > 1:

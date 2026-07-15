@@ -14,6 +14,61 @@ from .models import Session
 from .service import Services, build_services
 
 
+class RequestBodyLimitMiddleware:
+    """Reject request bodies by bytes read, including chunked requests."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in {
+            "POST",
+            "PUT",
+            "PATCH",
+        }:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_bytes:
+                    await _json_error(413, "request body is too large")(
+                        scope, receive, send
+                    )
+                    return
+            except ValueError:
+                await _json_error(400, "invalid content-length")(
+                    scope, receive, send
+                )
+                return
+
+        buffered = []
+        received = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                break
+            received += len(message.get("body", b""))
+            if received > self.max_bytes:
+                await _json_error(413, "request body is too large")(
+                    scope, receive, send
+                )
+                return
+            if not message.get("more_body", False):
+                break
+
+        async def replay_receive():
+            if buffered:
+                return buffered.pop(0)
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+
 class StartSessionRequest(BaseModel):
     agent: str = Field(default="unknown", min_length=1, max_length=128)
     session_id: str | None = Field(default=None, max_length=128)
@@ -77,21 +132,18 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.3.0",
+        version="0.3.1",
         lifespan=lifespan,
     )
     app.state.services = services
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_bytes=services.config.api.max_request_bytes,
+    )
     api_token = os.environ.get(services.config.api.bearer_token_env, "")
 
     @app.middleware("http")
     async def bearer_auth(request: Request, call_next):
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > services.config.api.max_request_bytes:
-                    return _json_error(413, "request body is too large")
-            except ValueError:
-                return _json_error(400, "invalid content-length")
         if api_token and request.url.path.startswith("/v1/"):
             authorization = request.headers.get("authorization", "")
             expected = f"Bearer {api_token}"
@@ -127,14 +179,19 @@ def create_app(
     ) -> dict[str, Any]:
         if len(payload.content) > services.config.api.max_message_chars:
             raise HTTPException(status_code=413, detail="message is too large")
-        return services.recorder.append(
-            session_id,
-            payload.role,
-            payload.content,
-            payload.created_at,
-            payload.metadata,
-            payload.external_event_id,
-        ).to_dict()
+        try:
+            return services.recorder.append(
+                session_id,
+                payload.role,
+                payload.content,
+                payload.created_at,
+                payload.metadata,
+                payload.external_event_id,
+            ).to_dict()
+        except RuntimeError as exc:
+            if "cannot append to" not in str(exc):
+                raise
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/sessions/{session_id}/end")
     def end_session(

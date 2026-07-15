@@ -2,7 +2,7 @@
   "id": "mnemonic-vault",
   "name": "Mnemonic Vault",
   "description": "File-first long-term memory with automatic capture and bounded recall.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "kind": "memory",
   "activation": {
     "onStartup": false
@@ -34,6 +34,7 @@
     "properties": {
       "baseUrl": { "type": "string" },
       "agent": { "type": "string" },
+      "agentInstanceId": { "type": "string", "minLength": 1 },
       "autoCapture": { "type": "boolean" },
       "autoRecall": { "type": "boolean" },
       "maxTopics": { "type": "integer", "minimum": 1, "maximum": 50 },

@@ -223,5 +223,6 @@ def write_topic(path: Path, topic: Topic) -> None:
 
 
 def estimate_tokens(text: str) -> int:
-    # Conservative tokenizer-independent approximation for trigger/budget handling.
-    return max(1, (len(text) + 3) // 4)
+    # Conservative tokenizer-independent fallback. Russian and mixed technical
+    # text often tokenize much more densely than the old characters/4 estimate.
+    return max(1, (len(text) * 2 + 4) // 5)

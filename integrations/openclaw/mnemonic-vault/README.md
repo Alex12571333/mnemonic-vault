@@ -25,3 +25,8 @@ installed plugin. Override it with the plugin's `spoolPath` setting or set
 `MNEMONIC_VAULT_PROJECT_ROOT`. For an authenticated LAN endpoint, export
 `MNEMONIC_VAULT_API_TOKEN`; `apiTokenEnv` can point to another environment
 variable name.
+
+`agentInstanceId` defaults to `openclaw-main`. Keep it stable across restarts and use
+a distinct value for each independent OpenClaw installation. Permanent delivery
+failures are preserved in `openclaw.dead-letter.jsonl`; retryable failures remain in
+the primary spool.

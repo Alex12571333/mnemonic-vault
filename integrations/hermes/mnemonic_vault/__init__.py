@@ -11,7 +11,13 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from typing import Any
 
-from .client import VaultClient, format_memory_context, vault_session_id
+from .client import (
+    VaultClient,
+    VaultHttpError,
+    format_memory_context,
+    recovery_session_id,
+    vault_session_id,
+)
 from .spool import DurableSpool
 
 try:
@@ -65,7 +71,10 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         self._summary_budget = _int_env(
             "MNEMONIC_VAULT_SUMMARY_BUDGET_TOKENS", 1500
         )
-        self._instance_id = f"{int(time.time() * 1000):x}-{os.getpid():x}"
+        self._agent_instance_id = (
+            os.getenv("MNEMONIC_VAULT_AGENT_INSTANCE_ID", "hermes-main").strip()
+            or "hermes-main"
+        )
         self._session_id = ""
         self._vault_sessions: dict[str, str] = {}
         self._write_enabled = True
@@ -427,7 +436,28 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                     self._deliver(event)
                     self._spool.acknowledge(str(event["event_id"]))
                 except Exception as exc:
-                    logger.warning("Mnemonic Vault background write failed; will retry: %s", exc)
+                    disposition = _delivery_error_disposition(exc)
+                    if disposition == "blocked":
+                        logger.error(
+                            "Mnemonic Vault delivery stopped by authentication/"
+                            "configuration error: %s",
+                            exc,
+                        )
+                        return
+                    if disposition == "permanent":
+                        status = exc.status if isinstance(exc, VaultHttpError) else None
+                        self._spool.dead_letter(
+                            event, str(exc), status=status
+                        )
+                        logger.warning(
+                            "Mnemonic Vault moved a permanent spool failure to "
+                            "dead-letter: %s",
+                            exc,
+                        )
+                        continue
+                    logger.warning(
+                        "Mnemonic Vault background write failed; will retry: %s", exc
+                    )
                     failed = True
                     break
             if failed:
@@ -437,16 +467,45 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                 self._wake_worker.clear()
 
     def _deliver(self, event: dict[str, Any]) -> None:
-        vault_id = str(event["session_id"])
-        self._client.start_session(vault_id, str(event.get("agent", "hermes")))
+        vault_id = str(event["session_id"]).strip()
+        external_id = str(event["external_session_id"]).strip()
+        agent = str(event.get("agent", "hermes")).strip()
+        if not vault_id or not external_id or not agent:
+            raise ValueError("missing session or agent identity")
+        self._client.start_session(vault_id, agent)
         if event.get("kind") == "message":
-            self._client.append_message(
-                vault_id,
-                str(event["role"]),
-                str(event["content"]),
-                dict(event.get("metadata") or {}),
-                str(event["event_id"]),
-            )
+            role_value = event.get("role")
+            content_value = event.get("content")
+            if (
+                not isinstance(role_value, str)
+                or not role_value.strip()
+                or not isinstance(content_value, str)
+                or not content_value
+            ):
+                raise ValueError("message role and content are required")
+            role = role_value.strip()
+            content = content_value
+            metadata = dict(event.get("metadata") or {})
+            try:
+                self._client.append_message(
+                    vault_id,
+                    role,
+                    content,
+                    metadata,
+                    str(event["event_id"]),
+                )
+            except VaultHttpError as exc:
+                if exc.status != 409:
+                    raise
+                recovery_id = recovery_session_id(vault_id)
+                self._client.start_session(recovery_id, agent)
+                self._client.append_message(
+                    recovery_id,
+                    role,
+                    content,
+                    {**metadata, "recovered_from_session": vault_id},
+                    str(event["event_id"]),
+                )
         elif event.get("kind") == "end":
             self._client.end_session(vault_id)
         else:
@@ -456,12 +515,14 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         existing = self._vault_sessions.get(external_id)
         if existing:
             return existing
-        vault_id = vault_session_id(external_id, "hermes", self._instance_id)
+        vault_id = vault_session_id(
+            external_id, "hermes", self._agent_instance_id
+        )
         self._vault_sessions[external_id] = vault_id
         return vault_id
 
     def backup_paths(self) -> list[str]:
-        return [str(self._spool.path)]
+        return [str(self._spool.path), str(self._spool.dead_letter_path)]
 
 
 def register(ctx: Any) -> None:
@@ -501,3 +562,15 @@ def _float_env(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _delivery_error_disposition(exc: Exception) -> str:
+    if isinstance(exc, VaultHttpError):
+        if exc.status in {401, 403}:
+            return "blocked"
+        if 400 <= exc.status < 500 and exc.status not in {408, 429}:
+            return "permanent"
+        return "retry"
+    if isinstance(exc, (KeyError, TypeError, ValueError)):
+        return "permanent"
+    return "retry"

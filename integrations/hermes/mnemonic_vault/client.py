@@ -175,15 +175,22 @@ class VaultClient:
         return parsed
 
 
-def vault_session_id(external_session_id: str, agent: str, instance_id: str) -> str:
+def vault_session_id(
+    external_session_id: str, agent: str, agent_instance_id: str
+) -> str:
     digest = hashlib.sha256(
-        f"{agent}:{external_session_id}:{instance_id}".encode()
+        f"{agent_instance_id}:{external_session_id}".encode()
     ).hexdigest()[:24]
     safe_agent = "".join(
         character.lower() if character.isalnum() or character in "_-" else "-"
         for character in agent
     )
     return f"session-{safe_agent}-{digest}"
+
+
+def recovery_session_id(session_id: str) -> str:
+    digest = hashlib.sha256(session_id.encode()).hexdigest()[:24]
+    return f"session-recovery-{digest}"
 
 
 def format_memory_context(value: dict[str, Any]) -> str:

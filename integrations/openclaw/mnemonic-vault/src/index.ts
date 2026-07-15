@@ -14,7 +14,9 @@ import {
   extractLastAssistant,
   formatMemoryContext,
   type IncludeSources,
+  recoverySessionId,
   VaultClient,
+  VaultHttpError,
   vaultSessionId,
 } from "./client.js";
 import { DurableSpool } from "./spool.js";
@@ -22,6 +24,7 @@ import { DurableSpool } from "./spool.js";
 type Config = {
   baseUrl: string;
   agent: string;
+  agentInstanceId: string;
   autoCapture: boolean;
   autoRecall: boolean;
   maxTopics: number;
@@ -36,6 +39,7 @@ type Config = {
 const DEFAULTS: Config = {
   baseUrl: "http://127.0.0.1:8765",
   agent: "openclaw",
+  agentInstanceId: "openclaw-main",
   autoCapture: true,
   autoRecall: true,
   maxTopics: 5,
@@ -53,6 +57,7 @@ const configSchema = buildJsonPluginConfigSchema({
   properties: {
     baseUrl: { type: "string" },
     agent: { type: "string" },
+    agentInstanceId: { type: "string", minLength: 1 },
     autoCapture: { type: "boolean" },
     autoRecall: { type: "boolean" },
     maxTopics: { type: "integer", minimum: 1, maximum: 50 },
@@ -70,6 +75,10 @@ function resolveConfig(value: unknown): Config {
   return {
     baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl : DEFAULTS.baseUrl,
     agent: typeof raw.agent === "string" ? raw.agent : DEFAULTS.agent,
+    agentInstanceId:
+      typeof raw.agentInstanceId === "string" && raw.agentInstanceId.trim()
+        ? raw.agentInstanceId.trim()
+        : DEFAULTS.agentInstanceId,
     autoCapture: raw.autoCapture ?? DEFAULTS.autoCapture,
     autoRecall: raw.autoRecall ?? DEFAULTS.autoRecall,
     maxTopics: finiteInt(raw.maxTopics, DEFAULTS.maxTopics),
@@ -107,6 +116,93 @@ function errorResult(error: unknown) {
   return toolResult({ error: "Mnemonic Vault request failed", detail: message });
 }
 
+type DeliveryClient = Pick<
+  VaultClient,
+  "startSession" | "appendMessage" | "endSession"
+>;
+
+type DeliveryLogger = { warn(message: string): void };
+
+class InvalidSpoolEventError extends Error {}
+
+export type SpoolFlushResult = "drained" | "retry" | "blocked";
+
+export async function flushDurableSpool(
+  spool: DurableSpool,
+  client: DeliveryClient,
+  logger: DeliveryLogger,
+): Promise<SpoolFlushResult> {
+  for (const event of spool.pending()) {
+    try {
+      if (!event.session_id || !event.external_session_id || !event.agent) {
+        throw new InvalidSpoolEventError("missing session or agent identity");
+      }
+      await client.startSession(
+        event.session_id,
+        event.agent,
+        event.external_session_id,
+      );
+      if (event.kind === "message") {
+        if (!event.role || !event.content) {
+          throw new InvalidSpoolEventError("message role and content are required");
+        }
+        try {
+          await client.appendMessage(
+            event.session_id,
+            event.role,
+            event.content,
+            event.metadata ?? {},
+            event.event_id,
+          );
+        } catch (error) {
+          if (!(error instanceof VaultHttpError) || error.status !== 409) throw error;
+          const recoveryId = recoverySessionId(event.session_id);
+          await client.startSession(recoveryId, event.agent, event.external_session_id);
+          await client.appendMessage(
+            recoveryId,
+            event.role,
+            event.content,
+            {
+              ...(event.metadata ?? {}),
+              recovered_from_session: event.session_id,
+            },
+            event.event_id,
+          );
+        }
+      } else if (event.kind === "end") {
+        await client.endSession(event.session_id);
+      } else {
+        throw new InvalidSpoolEventError(`unknown event kind: ${String(event.kind)}`);
+      }
+      spool.acknowledge(event.event_id);
+    } catch (error) {
+      if (error instanceof VaultHttpError && [401, 403].includes(error.status)) {
+        logger.warn(
+          `Mnemonic Vault spool delivery blocked by authentication/configuration error: ${String(error)}`,
+        );
+        return "blocked";
+      }
+      const permanent =
+        error instanceof InvalidSpoolEventError ||
+        (error instanceof VaultHttpError &&
+          error.status >= 400 &&
+          error.status < 500 &&
+          ![408, 429].includes(error.status));
+      if (permanent) {
+        const status = error instanceof VaultHttpError ? error.status : undefined;
+        spool.deadLetter(event, error instanceof Error ? error.message : String(error), status);
+        logger.warn(
+          `Mnemonic Vault moved a permanent spool failure to dead-letter: ${String(error)}`,
+        );
+        continue;
+      }
+      logger.warn(`Mnemonic Vault spool delivery failed; will retry: ${String(error)}`);
+      return "retry";
+    }
+  }
+  return "drained";
+}
+
 export default definePluginEntry({
   id: "mnemonic-vault",
   name: "Mnemonic Vault",
@@ -120,7 +216,6 @@ export default definePluginEntry({
       config.requestTimeoutMs,
       process.env[config.apiTokenEnv] ?? "",
     );
-    const instanceId = `${Date.now().toString(36)}-${process.pid.toString(36)}`;
     const sessions = new Map<string, string>();
     const captured = new Set<string>();
     const sourceRoot = fileURLToPath(new URL("../../../../", import.meta.url));
@@ -142,37 +237,24 @@ export default definePluginEntry({
     const vaultSession = (externalId: string): string => {
       const existing = sessions.get(externalId);
       if (existing) return existing;
-      const vaultId = vaultSessionId(externalId, config.agent, instanceId);
+      const vaultId = vaultSessionId(
+        externalId,
+        config.agent,
+        config.agentInstanceId,
+      );
       sessions.set(externalId, vaultId);
       return vaultId;
     };
 
     let flushing: Promise<void> | undefined;
+    let deliveryBlocked = false;
     const flushSpool = async (): Promise<void> => {
       if (!spool) return;
-      for (const event of spool.pending()) {
-        try {
-          await client.startSession(event.session_id, event.agent, event.external_session_id);
-          if (event.kind === "message") {
-            await client.appendMessage(
-              event.session_id,
-              event.role ?? "unknown",
-              event.content ?? "",
-              event.metadata ?? {},
-              event.event_id,
-            );
-          } else {
-            await client.endSession(event.session_id);
-          }
-          spool.acknowledge(event.event_id);
-        } catch (error) {
-          api.logger.warn(`Mnemonic Vault spool delivery failed; will retry: ${String(error)}`);
-          break;
-        }
-      }
+      const result = await flushDurableSpool(spool, client, api.logger);
+      deliveryBlocked = result === "blocked";
     };
     const scheduleFlush = (): void => {
-      if (!spool || flushing) return;
+      if (!spool || flushing || deliveryBlocked) return;
       flushing = flushSpool().finally(() => {
         flushing = undefined;
       });

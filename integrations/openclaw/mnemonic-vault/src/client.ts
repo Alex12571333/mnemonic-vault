@@ -169,13 +169,18 @@ export class VaultClient {
 export function vaultSessionId(
   externalSessionId: string,
   agent: string,
-  instanceId: string,
+  agentInstanceId: string,
 ): string {
   const digest = createHash("sha256")
-    .update(`${agent}:${externalSessionId}:${instanceId}`)
+    .update(`${agentInstanceId}:${externalSessionId}`)
     .digest("hex")
     .slice(0, 24);
   return `session-${agent.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}-${digest}`;
+}
+
+export function recoverySessionId(sessionId: string): string {
+  const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
+  return `session-recovery-${digest}`;
 }
 
 export function formatMemoryContext(value: Record<string, unknown>): string {

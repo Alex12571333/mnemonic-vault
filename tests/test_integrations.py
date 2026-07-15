@@ -106,15 +106,20 @@ class HermesProviderTests(unittest.TestCase):
         manifest = json.loads((root / "integrations/openclaw/mnemonic-vault/"
                                       "openclaw.plugin.json").read_text())
         self.assertEqual(manifest["kind"], "memory")
-        self.assertEqual(manifest["version"], "0.3.0")
+        self.assertEqual(manifest["version"], "0.3.1")
         self.assertEqual(len(manifest["contracts"]["tools"]), 6)
 
 
 class IntegrationHelpersTests(unittest.TestCase):
     def test_session_id_is_stable_and_safe(self):
-        value = vault_session_id("cli:main:42", "hermes", "test")
+        value = vault_session_id("cli:main:42", "hermes", "hermes-main")
         self.assertRegex(value, r"^session-hermes-[a-f0-9]{24}$")
-        self.assertEqual(value, vault_session_id("cli:main:42", "hermes", "test"))
+        self.assertEqual(
+            value, vault_session_id("cli:main:42", "hermes", "hermes-main")
+        )
+        self.assertNotEqual(
+            value, vault_session_id("cli:main:42", "hermes", "hermes-secondary")
+        )
 
     def test_empty_recall_context_is_omitted(self):
         self.assertEqual(format_memory_context({"topics": []}), "")

@@ -29,3 +29,8 @@ The default spool is `~/mnemonic-vault/data/spool/hermes.jsonl` for an installed
 plugin. Set `MNEMONIC_VAULT_PROJECT_ROOT` or `MNEMONIC_VAULT_SPOOL_DIR` when the
 portable project lives elsewhere. For an authenticated LAN endpoint, export the
 same `MNEMONIC_VAULT_API_TOKEN` used by the Vault service.
+
+`MNEMONIC_VAULT_AGENT_INSTANCE_ID` defaults to `hermes-main`. Keep it stable across
+restarts and assign different values to independent Hermes installations. Permanent
+delivery failures are preserved in `hermes.dead-letter.jsonl`; retryable failures stay
+in the primary spool.
