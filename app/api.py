@@ -73,7 +73,7 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.state.services = services

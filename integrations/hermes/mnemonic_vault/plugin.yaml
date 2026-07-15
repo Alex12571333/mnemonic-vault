@@ -1,0 +1,7 @@
+name: mnemonic_vault
+version: 0.2.0
+description: "Mnemonic Vault file-first long-term memory with bounded hybrid recall and source-level expansion."
+requires_env: []
+hooks:
+  - on_session_end
+  - on_session_switch

@@ -92,6 +92,17 @@ python run.py resummarize --session session-a83f
 Незавершённые jobs при старте переводятся обратно в `pending`. После трёх неудачных
 попыток job получает статус `failed`; исходный transcript при этом уже сохранён.
 
+## Нативные интеграции агентов
+
+Версия 0.2 включает два полноценных адаптера:
+
+- OpenClaw memory-slot plugin с lifecycle hooks, шестью memory tools и встроенным skill;
+- Hermes Agent `MemoryProvider` с неблокирующей очередью записи, bounded prefetch и теми же tools.
+
+Оба адаптера автоматически сохраняют ходы, подмешивают только небольшой релевантный
+контекст и позволяют раскрывать исходные transcript ranges для точных значений.
+Установка и проверка описаны в [документации интеграций](docs/native-integrations.md).
+
 ## Перенос и резервная копия
 
 Остановите процесс или сделайте SQLite checkpoint, затем скопируйте всю папку:
@@ -123,4 +134,5 @@ curl -sS http://127.0.0.1:8765/health
 
 ```bash
 python -m unittest discover -s tests -v
+cd integrations/openclaw/mnemonic-vault && npm ci && npm run check
 ```

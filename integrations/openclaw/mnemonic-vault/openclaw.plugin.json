@@ -1,0 +1,45 @@
+{
+  "id": "mnemonic-vault",
+  "name": "Mnemonic Vault",
+  "description": "File-first long-term memory with automatic capture and bounded recall.",
+  "version": "0.2.0",
+  "kind": "memory",
+  "activation": {
+    "onStartup": false
+  },
+  "contracts": {
+    "tools": [
+      "memory_search",
+      "memory_get",
+      "memory_open_topic",
+      "memory_expand_topic",
+      "memory_read_turns",
+      "memory_search_transcript"
+    ]
+  },
+  "toolMetadata": {
+    "memory_search": { "replaySafe": true },
+    "memory_get": { "replaySafe": true },
+    "memory_open_topic": { "replaySafe": true },
+    "memory_expand_topic": { "replaySafe": true },
+    "memory_read_turns": { "replaySafe": true },
+    "memory_search_transcript": { "replaySafe": true }
+  },
+  "skills": [
+    "./skills"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": { "type": "string" },
+      "agent": { "type": "string" },
+      "autoCapture": { "type": "boolean" },
+      "autoRecall": { "type": "boolean" },
+      "maxTopics": { "type": "integer", "minimum": 1, "maximum": 50 },
+      "summaryBudgetTokens": { "type": "integer", "minimum": 100, "maximum": 32000 },
+      "includeSources": { "type": "string", "enum": ["auto", "always", "never"] },
+      "requestTimeoutMs": { "type": "integer", "minimum": 250, "maximum": 60000 }
+    }
+  }
+}
