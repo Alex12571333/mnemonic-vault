@@ -1,0 +1,15 @@
+[Unit]
+Description=Mnemonic Vault file-first agent memory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mnemonic-vault
+ExecStart=%h/mnemonic-vault/.venv/bin/python %h/mnemonic-vault/run.py serve --host 127.0.0.1 --port 8765
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

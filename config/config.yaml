@@ -1,0 +1,37 @@
+storage:
+  root: "./data"
+  sessions_dir: "./data/sessions"
+  catalog_db: "./data/catalog.sqlite"
+
+summarization:
+  messages_per_batch: 20
+  token_threshold: 12000
+  idle_minutes: 30
+  max_input_tokens: 16000
+  max_output_tokens: 2500
+
+retrieval:
+  lexical_top_k: 30
+  vector_top_k: 30
+  final_top_k: 5
+  auto_open_summaries: 2
+  summary_budget_tokens: 1800
+  source_budget_tokens: 1800
+  minimum_score: 0.35
+  rrf_k: 60
+
+memory_llm:
+  # Проверено с хоста .14: активный vLLM endpoint Qwen работает на DGX Spark .10.
+  base_url: "http://192.168.0.10:8000/v1"
+  model: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+  temperature: 0
+  enable_thinking: false
+  timeout_seconds: 180
+
+embeddings:
+  # FastEmbed запускается внутри процесса на .14; модель и cache лежат в data/models/.
+  provider: "fastembed"
+  base_url: ""
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  dimension: 384
+  timeout_seconds: 30
