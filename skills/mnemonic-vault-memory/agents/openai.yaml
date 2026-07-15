@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mnemonic Vault Memory"
+  short_description: "Recall and inspect durable agent memory"
+  default_prompt: "Use $mnemonic-vault-memory to recall relevant past decisions and exact source turns."

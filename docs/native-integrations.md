@@ -1,0 +1,106 @@
+# Native OpenClaw and Hermes integrations
+
+Mnemonic Vault 0.2 ships two native adapters. Both use the same loopback HTTP
+API, expose the same six memory tools, automatically record completed turns, and
+inject only a bounded amount of retrieved history. Retrieval stays
+non-generative; the Memory LLM continues to run only in the background
+summarizer.
+
+## Shared memory workflow
+
+The integrations expose:
+
+- `memory_search(query)` — hybrid topic search with a summary budget;
+- `memory_get(topic_id)` and `memory_open_topic(topic_id)` — open one summary;
+- `memory_expand_topic(topic_id, query)` — exact fragments from topic ranges;
+- `memory_read_turns(session_id, from_turn, to_turn)` — explicit transcript range;
+- `memory_search_transcript(query, session_id?)` — last-resort raw search.
+
+Retrieved content is marked as historical reference data, not instructions.
+Exact commands, versions, numbers, dates, parameters, addresses, and errors
+should be verified against transcript fragments. Mutable facts should also be
+checked against current live state.
+
+## OpenClaw memory-slot plugin
+
+The plugin lives in `integrations/openclaw/mnemonic-vault`. It uses OpenClaw's
+native plugin manifest, direct tool registration, lifecycle hooks, bundled
+skill, and the exclusive `memory` slot.
+
+```bash
+cd integrations/openclaw/mnemonic-vault
+npm ci
+npm run check
+openclaw plugins install -l .
+openclaw plugins enable mnemonic-vault
+openclaw config set plugins.slots.memory mnemonic-vault
+openclaw config set plugins.entries.mnemonic-vault.config.baseUrl http://127.0.0.1:8765
+openclaw config set plugins.entries.mnemonic-vault.hooks.allowConversationAccess true --strict-json
+openclaw gateway restart
+openclaw plugins inspect mnemonic-vault --runtime --json
+openclaw plugins doctor
+```
+
+`before_prompt_build` writes the user turn and prepends bounded recall;
+`agent_end` writes the final assistant response. Session hooks create and
+finalize Vault sessions. `allowConversationAccess` is required because
+`agent_end` reads the final assistant message. A Vault failure is logged and
+does not abort the agent turn. Configuration keys are documented in
+`openclaw.plugin.json`; the default API is `http://127.0.0.1:8765`.
+
+## Hermes `MemoryProvider`
+
+The provider lives in `integrations/hermes/mnemonic_vault`. Install it under the
+Hermes user plugin directory and install the shared skill separately:
+
+```bash
+mkdir -p ~/.hermes/plugins ~/.hermes/skills
+cp -a integrations/hermes/mnemonic_vault ~/.hermes/plugins/
+cp -a skills/mnemonic-vault-memory ~/.hermes/skills/
+```
+
+Select it in `~/.hermes/config.yaml`:
+
+```yaml
+memory:
+  provider: mnemonic_vault
+```
+
+Then verify discovery with `hermes memory status`. Hermes calls `sync_turn`
+after each completed turn. The provider enqueues both messages and returns
+immediately; a daemon worker preserves their order and writes them to the Vault.
+Recall is prefetched in a small thread pool with a bounded timeout.
+
+| Variable | Default |
+| --- | --- |
+| `MNEMONIC_VAULT_URL` | `http://127.0.0.1:8765` |
+| `MNEMONIC_VAULT_REQUEST_TIMEOUT_SECONDS` | `8` |
+| `MNEMONIC_VAULT_PREFETCH_TIMEOUT_SECONDS` | `2.5` |
+| `MNEMONIC_VAULT_AUTO_CAPTURE` | `true` |
+| `MNEMONIC_VAULT_AUTO_RECALL` | `true` |
+| `MNEMONIC_VAULT_MAX_TOPICS` | `5` |
+| `MNEMONIC_VAULT_SUMMARY_BUDGET_TOKENS` | `1800` |
+
+## Verified `.14` topology
+
+The production layout used during the 0.2 release:
+
+- Mnemonic Vault service and local FastEmbed: `192.168.0.14`;
+- OpenClaw 2026.7.1 and Hermes Agent 0.17.0: `192.168.0.14`;
+- Vault API: `http://127.0.0.1:8765` on that machine;
+- Qwen/vLLM summarizer: `http://192.168.0.10:8000/v1`.
+
+The Qwen endpoint is outside the agents' online retrieval path. If it is
+unavailable, immutable transcripts continue to be recorded and queued summary
+jobs can be retried later.
+
+## Official specifications used
+
+- [OpenClaw plugins](https://docs.openclaw.ai/plugins)
+- [OpenClaw plugin manifest](https://docs.openclaw.ai/plugins/manifest)
+- [OpenClaw tool plugins](https://docs.openclaw.ai/plugins/tool-plugins)
+- [OpenClaw plugin hooks](https://docs.openclaw.ai/plugins/hooks)
+- [OpenClaw skills](https://docs.openclaw.ai/skills)
+- [Hermes plugins](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins)
+- [Hermes memory-provider plugins](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin/)
+- [Hermes skills](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/skills.md)
