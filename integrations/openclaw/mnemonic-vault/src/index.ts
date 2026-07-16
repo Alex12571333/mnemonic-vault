@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import {
   extractLastAssistant,
   formatMemoryContext,
   type IncludeSources,
+  type MemoryKind,
   deterministicEventId,
   recoverySessionId,
   VaultClient,
@@ -304,6 +306,17 @@ export default definePluginEntry({
         include_sources: Type.Optional(
           Type.Union([Type.Literal("auto"), Type.Literal("always"), Type.Literal("never")]),
         ),
+        scope: Type.Optional(
+          Type.Object({
+            type: Type.Union([
+              Type.Literal("global"),
+              Type.Literal("agent"),
+              Type.Literal("project"),
+              Type.Literal("session"),
+            ]),
+            id: Type.Optional(Type.String()),
+          }),
+        ),
       }),
       async execute(_id, rawParams) {
         const params = rawParams as Record<string, any>;
@@ -314,10 +327,116 @@ export default definePluginEntry({
               summaryBudgetTokens: params.summary_budget_tokens,
               totalContextBudgetTokens: params.total_context_budget_tokens,
               includeSources: params.include_sources,
+              scope: params.scope,
             }),
           );
         } catch (error) {
           return errorResult(error);
+        }
+      },
+    });
+
+    api.registerTool({
+      name: "memory_remember",
+      label: "Remember explicit memory",
+      description:
+        "Store an explicit user-requested memory immediately. Call only when the user directly asks to remember, save, not forget, or always keep something.",
+      parameters: Type.Object({
+        verbatim: Type.String(),
+        normalized: Type.Optional(Type.String()),
+        kind: Type.Optional(
+          Type.Union([
+            Type.Literal("fact"),
+            Type.Literal("preference"),
+            Type.Literal("decision"),
+            Type.Literal("configuration"),
+            Type.Literal("identity"),
+            Type.Literal("constraint"),
+            Type.Literal("task"),
+            Type.Literal("correction"),
+          ]),
+        ),
+        scope: Type.Object({
+          type: Type.Union([
+            Type.Literal("global"),
+            Type.Literal("agent"),
+            Type.Literal("project"),
+            Type.Literal("session"),
+          ]),
+          id: Type.Optional(Type.String()),
+        }),
+        source_session_id: Type.Optional(Type.String()),
+        source_message_id: Type.Optional(Type.Integer({ minimum: 1 })),
+        idempotency_key: Type.Optional(Type.String()),
+        supersedes: Type.Optional(Type.String()),
+      }),
+      async execute(_id, rawParams) {
+        const params = rawParams as Record<string, any>;
+        try {
+          return toolResult(
+            await client.remember(params.verbatim, {
+              normalized: params.normalized,
+              kind: params.kind as MemoryKind | undefined,
+              scope: params.scope,
+              sourceSessionId: params.source_session_id,
+              sourceMessageId: params.source_message_id,
+              idempotencyKey: params.idempotency_key,
+              supersedes: params.supersedes,
+            }),
+          );
+        } catch (error) {
+          return errorResult(error);
+        }
+      },
+    });
+
+    api.registerCommand({
+      name: "remember",
+      description: "Store explicit memory immediately without invoking the LLM.",
+      acceptsArgs: true,
+      exposeSenderIsOwner: true,
+      handler: async (ctx) => {
+        const raw = (ctx.args ?? "").trim();
+        if (!raw) {
+          return {
+            text: "Usage: /remember [global|agent:<id>|project:<id>|session] <exact fact>",
+            isError: true,
+          };
+        }
+        const scoped = raw.match(/^(global|agent:[a-zA-Z0-9._-]+|project:[a-zA-Z0-9._-]+|session)\s+([\s\S]+)$/);
+        const selector = scoped?.[1];
+        const verbatim = (scoped?.[2] ?? raw).trim();
+        const externalId = externalSession(ctx);
+        let scope: { type: "global" | "agent" | "project" | "session"; id?: string };
+        if (selector === "global") {
+          scope = { type: "global" };
+        } else if (selector === "session") {
+          scope = { type: "session", id: vaultSession(externalId) };
+        } else if (selector?.startsWith("project:")) {
+          scope = { type: "project", id: selector.slice("project:".length) };
+        } else if (selector?.startsWith("agent:")) {
+          scope = { type: "agent", id: selector.slice("agent:".length) };
+        } else {
+          scope = { type: "agent", id: config.agentInstanceId };
+        }
+        const digest = createHash("sha256")
+          .update(`${config.agentInstanceId}\0${externalId}\0${ctx.commandBody}`)
+          .digest("hex")
+          .slice(0, 40);
+        try {
+          const receipt = await client.remember(verbatim, {
+            normalized: verbatim,
+            scope,
+            idempotencyKey: `event-${digest}`,
+          });
+          return {
+            text: `Remembered (${String(receipt.memory_id ?? "stored")}): ${verbatim}`,
+          };
+        } catch (error) {
+          return {
+            text: `Mnemonic Vault could not store memory: ${error instanceof Error ? error.message : String(error)}`,
+            isError: true,
+          };
         }
       },
     });

@@ -134,3 +134,97 @@ class SearchHit:
         if self.source_fragments:
             value["source_fragments"] = self.source_fragments
         return value
+
+
+@dataclass(slots=True)
+class ExplicitMemory:
+    memory_id: str
+    idempotency_key: str
+    verbatim: str
+    normalized: str
+    kind: str
+    scope_type: str
+    scope_id: str | None
+    author: str
+    source_session_id: str
+    source_message_id: int
+    created_at: str
+    status: str = "active"
+    event: str = "remember"
+    supersedes: str | None = None
+    valid_to: str | None = None
+    requires_confirmation: bool = False
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ExplicitMemory":
+        scope = value.get("scope", {})
+        if isinstance(scope, str):
+            scope_type, _, scope_id = scope.partition(":")
+        elif isinstance(scope, dict):
+            scope_type = str(scope.get("type", "global"))
+            raw_scope_id = scope.get("id")
+            scope_id = str(raw_scope_id) if raw_scope_id not in (None, "") else ""
+        else:
+            scope_type, scope_id = "global", ""
+        return cls(
+            memory_id=str(value["memory_id"]),
+            idempotency_key=str(value["idempotency_key"]),
+            verbatim=str(value["verbatim"]),
+            normalized=str(value.get("normalized") or value["verbatim"]),
+            kind=str(value["kind"]),
+            scope_type=scope_type,
+            scope_id=scope_id or None,
+            author=str(value.get("author", "user")),
+            source_session_id=str(value["source_session_id"]),
+            source_message_id=int(value["source_message_id"]),
+            created_at=str(value["created_at"]),
+            status=str(value.get("status", "active")),
+            event=str(value.get("event", "remember")),
+            supersedes=(
+                str(value["supersedes"]) if value.get("supersedes") else None
+            ),
+            valid_to=str(value["valid_to"]) if value.get("valid_to") else None,
+            requires_confirmation=bool(value.get("requires_confirmation", False)),
+        )
+
+    def scope(self) -> dict[str, str]:
+        result = {"type": self.scope_type}
+        if self.scope_id:
+            result["id"] = self.scope_id
+        return result
+
+    def to_event_dict(self) -> dict[str, Any]:
+        return {
+            "event": self.event,
+            "memory_id": self.memory_id,
+            "idempotency_key": self.idempotency_key,
+            "verbatim": self.verbatim,
+            "normalized": self.normalized,
+            "kind": self.kind,
+            "scope": self.scope(),
+            "author": self.author,
+            "source_session_id": self.source_session_id,
+            "source_message_id": self.source_message_id,
+            "created_at": self.created_at,
+            "status": "active",
+            "supersedes": self.supersedes,
+            "requires_confirmation": self.requires_confirmation,
+        }
+
+    def to_search_dict(self, score: float = 1.0) -> dict[str, Any]:
+        return {
+            "type": "explicit_memory",
+            "memory_id": self.memory_id,
+            "text": self.normalized,
+            "verbatim": self.verbatim,
+            "kind": self.kind,
+            "scope": self.scope(),
+            "author": self.author,
+            "status": self.status,
+            "supersedes": self.supersedes,
+            "valid_to": self.valid_to,
+            "source_session_id": self.source_session_id,
+            "source_message_id": self.source_message_id,
+            "created_at": self.created_at,
+            "score": round(score, 6),
+        }

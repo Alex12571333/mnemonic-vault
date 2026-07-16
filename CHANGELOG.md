@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-07-16
+
+- Add append-only `data/explicit-memory.jsonl` for direct user-authored memories,
+  with SQLite materialization and immediate FTS recall independent of the Memory LLM.
+- Add idempotent `memory_remember`, exact transcript-source validation, constrained
+  kinds/scopes, append-only supersession history, and priority summary jobs.
+- Include active explicit memories in bounded search context, boost matching scopes,
+  and expose superseded facts only for deterministic historical queries.
+- Rebuild explicit memory from files with `rebuild-index` and add its optional vectors
+  to `reembed-all` without making embeddings part of the write commit path.
+- Add the direct API/CLI remember path, the OpenClaw `/remember` LLM-bypass command,
+  and `memory_remember` tools for OpenClaw and Hermes.
+
 ## 0.4.1 — 2026-07-16
 
 - Choose the latest global-topic snapshot by `topic.updated_at` while retaining the

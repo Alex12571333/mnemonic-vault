@@ -88,12 +88,39 @@ class EndSessionRequest(BaseModel):
     ended_at: str | None = Field(default=None, max_length=64)
 
 
+class MemoryScopeRequest(BaseModel):
+    type: Literal["global", "agent", "project", "session"] = "global"
+    id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=100_000)
     max_topics: int = Field(default=5, ge=1, le=50)
     summary_budget_tokens: int | None = Field(default=None, ge=100, le=32000)
     total_context_budget_tokens: int | None = Field(default=None, ge=100, le=32000)
     include_sources: Literal["auto", "always", "never"] = "auto"
+    scope: MemoryScopeRequest | None = None
+
+
+class RememberRequest(BaseModel):
+    verbatim: str = Field(min_length=1, max_length=100_000)
+    normalized: str | None = Field(default=None, min_length=1, max_length=100_000)
+    kind: Literal[
+        "fact",
+        "preference",
+        "decision",
+        "configuration",
+        "identity",
+        "constraint",
+        "task",
+        "correction",
+    ] = "fact"
+    scope: MemoryScopeRequest = Field(default_factory=MemoryScopeRequest)
+    source_session_id: str | None = Field(default=None, max_length=128)
+    source_message_id: int | None = Field(default=None, ge=1)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+    supersedes: str | None = Field(default=None, max_length=128)
+    created_at: str | None = Field(default=None, max_length=64)
 
 
 class ExpandRequest(BaseModel):
@@ -134,7 +161,7 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.4.1",
+        version="0.5.0",
         lifespan=lifespan,
     )
     app.state.services = services
@@ -233,7 +260,32 @@ def create_app(
             payload.summary_budget_tokens,
             payload.include_sources,
             payload.total_context_budget_tokens,
+            payload.scope.type if payload.scope else None,
+            payload.scope.id if payload.scope else None,
         )
+
+    @app.post("/v1/memory/remember", status_code=201)
+    def remember(payload: RememberRequest) -> dict[str, Any]:
+        if services.explicit_memory is None:
+            raise HTTPException(status_code=503, detail="explicit memory is unavailable")
+        return services.explicit_memory.remember(
+            payload.verbatim,
+            normalized=payload.normalized,
+            kind=payload.kind,
+            scope_type=payload.scope.type,
+            scope_id=payload.scope.id,
+            source_session_id=payload.source_session_id,
+            source_message_id=payload.source_message_id,
+            idempotency_key=payload.idempotency_key,
+            supersedes=payload.supersedes,
+            created_at=payload.created_at,
+        )
+
+    @app.get("/v1/memory/explicit/{memory_id}")
+    def open_explicit_memory(memory_id: str) -> dict[str, Any]:
+        if services.explicit_memory is None:
+            raise HTTPException(status_code=503, detail="explicit memory is unavailable")
+        return services.explicit_memory.get(memory_id).to_search_dict()
 
     @app.get("/v1/memory/global-topics")
     def list_global_topics(

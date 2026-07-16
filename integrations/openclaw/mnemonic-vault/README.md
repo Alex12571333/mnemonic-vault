@@ -7,6 +7,16 @@ skill. Captured
 events are `fsync`ed to a persistent spool before delivery and replayed with
 stable event IDs after OpenClaw or Vault restarts.
 
+The plugin exposes `memory_remember` for direct user requests and a guaranteed
+LLM-bypass command:
+
+```text
+/remember project:mnemonic-vault Production runs on 192.168.0.14
+```
+
+Without an explicit scope selector, `/remember` uses the current OpenClaw agent
+installation scope (`agent:openclaw-main`).
+
 Requires OpenClaw 2026.7.1 or newer and a reachable Mnemonic Vault API.
 
 ```bash

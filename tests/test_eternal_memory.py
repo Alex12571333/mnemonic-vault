@@ -205,6 +205,8 @@ class EternalMemoryTest(unittest.TestCase):
                 "topics": 1,
                 "messages": 4,
                 "recovered_jobs": 0,
+                "explicit_memories": 0,
+                "explicit_memory_failures": 0,
                 "failures": 0,
             },
         )
