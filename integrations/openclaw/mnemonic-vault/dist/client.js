@@ -134,6 +134,15 @@ export function recoverySessionId(sessionId) {
     const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
     return `session-recovery-${digest}`;
 }
+export function deterministicEventId(agentInstanceId, externalSessionId, role, runId, messageSequence, content) {
+    const turnIdentity = runId?.trim()
+        ? `run:${runId.trim()}`
+        : `sequence:${messageSequence ?? "unknown"}:content:${content}`;
+    const digest = createHash("sha256")
+        .update(`${agentInstanceId}\0${externalSessionId}\0${role}\0${turnIdentity}`)
+        .digest("hex");
+    return `event-${digest.slice(0, 40)}`;
+}
 export function formatMemoryContext(value) {
     const topics = Array.isArray(value.topics)
         ? value.topics.filter(isRecord).slice(0, 3)

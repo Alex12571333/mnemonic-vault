@@ -106,7 +106,7 @@ class HermesProviderTests(unittest.TestCase):
         manifest = json.loads((root / "integrations/openclaw/mnemonic-vault/"
                                       "openclaw.plugin.json").read_text())
         self.assertEqual(manifest["kind"], "memory")
-        self.assertEqual(manifest["version"], "0.3.1")
+        self.assertEqual(manifest["version"], "0.3.2")
         self.assertEqual(len(manifest["contracts"]["tools"]), 6)
 
 

@@ -338,15 +338,44 @@ class Catalog:
                 (session_id, external_event_id),
             ).fetchone()
 
-    def search_messages(
-        self, fts_query: str, limit: int, session_id: str | None = None
-    ) -> list[sqlite3.Row]:
+    def message_by_external_event_global(
+        self, external_event_id: str
+    ) -> sqlite3.Row | None:
+        """Find an adapter-generated deterministic event across all sessions."""
         with self.connection() as connection:
-            where_session = " AND session_id = ?" if session_id else ""
+            return connection.execute(
+                """
+                SELECT * FROM messages
+                WHERE external_event_id = ?
+                ORDER BY created_at, session_id, message_id
+                LIMIT 1
+                """,
+                (external_event_id,),
+            ).fetchone()
+
+    def search_messages(
+        self,
+        fts_query: str,
+        limit: int,
+        session_id: str | None = None,
+        session_ids: Sequence[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        if session_id and session_ids is not None:
+            raise ValueError("pass session_id or session_ids, not both")
+        selected_ids = list(
+            dict.fromkeys(session_ids or ([] if not session_id else [session_id]))
+        )
+        if session_ids is not None and not selected_ids:
+            return []
+        with self.connection() as connection:
+            placeholders = ",".join("?" for _ in selected_ids)
+            where_session = (
+                f" AND session_id IN ({placeholders})" if selected_ids else ""
+            )
             parameters: tuple[object, ...] = (
-                (fts_query, session_id, limit)
-                if session_id
-                else (fts_query, limit)
+                fts_query,
+                *selected_ids,
+                limit,
             )
             return connection.execute(
                 f"""
@@ -420,26 +449,53 @@ class Catalog:
             ).fetchall()
 
     def lexical_search(
-        self, fts_query: str, limit: int, session_id: str | None = None
+        self,
+        fts_query: str,
+        limit: int,
+        session_id: str | None = None,
+        session_started_prefix: str | None = None,
     ) -> list[sqlite3.Row]:
         with self.connection() as connection:
             session_filter = " AND t.session_id = ?" if session_id else ""
+            date_join = (
+                " JOIN sessions AS s ON s.id = t.session_id"
+                if session_started_prefix
+                else ""
+            )
+            date_filter = " AND s.started_at LIKE ?" if session_started_prefix else ""
             parameters: tuple[object, ...] = (
-                (fts_query, session_id, limit)
-                if session_id
-                else (fts_query, limit)
+                fts_query,
+                *((session_id,) if session_id else ()),
+                *((f"{session_started_prefix}%",) if session_started_prefix else ()),
+                limit,
             )
             return connection.execute(
                 f"""
                 SELECT t.*, bm25(topics_fts, 0.0, 5.0, 3.0, 3.0, 2.0, 1.0) AS bm25_score
                 FROM topics_fts
                 JOIN topics AS t ON t.id = topics_fts.topic_id
-                WHERE topics_fts MATCH ?{session_filter}
+                {date_join}
+                WHERE topics_fts MATCH ?{session_filter}{date_filter}
                 ORDER BY bm25_score
                 LIMIT ?
                 """,
                 parameters,
             ).fetchall()
+
+    def topic_ids_for_session_started_prefix(self, prefix: str) -> list[str]:
+        with self.connection() as connection:
+            return [
+                str(row["id"])
+                for row in connection.execute(
+                    """
+                    SELECT t.id
+                    FROM topics AS t
+                    JOIN sessions AS s ON s.id = t.session_id
+                    WHERE s.started_at LIKE ?
+                    """,
+                    (f"{prefix}%",),
+                ).fetchall()
+            ]
 
     def enqueue_job(
         self,
@@ -531,11 +587,18 @@ class Catalog:
     def list_embeddings(self, topic_ids: Sequence[str] | None = None) -> list[sqlite3.Row]:
         with self.connection() as connection:
             if topic_ids:
-                placeholders = ",".join("?" for _ in topic_ids)
-                return connection.execute(
-                    f"SELECT * FROM topic_embeddings WHERE topic_id IN ({placeholders})",
-                    tuple(topic_ids),
-                ).fetchall()
+                rows: list[sqlite3.Row] = []
+                for offset in range(0, len(topic_ids), 900):
+                    batch = topic_ids[offset : offset + 900]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows.extend(
+                        connection.execute(
+                            "SELECT * FROM topic_embeddings "
+                            f"WHERE topic_id IN ({placeholders})",
+                            tuple(batch),
+                        ).fetchall()
+                    )
+                return rows
             return connection.execute("SELECT * FROM topic_embeddings").fetchall()
 
     def save_embedding(

@@ -14,6 +14,7 @@ from typing import Any
 from .client import (
     VaultClient,
     VaultHttpError,
+    deterministic_event_id,
     format_memory_context,
     recovery_session_id,
     vault_session_id,
@@ -191,10 +192,20 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         metadata = {
             "source": "hermes-memory-provider",
             "external_session_id": external_id,
+            "agent_instance_id": self._agent_instance_id,
         }
+        message_sequence = len(messages) if messages is not None else None
         if user_content:
             self._spool.append(
                 {
+                    "event_id": deterministic_event_id(
+                        self._agent_instance_id,
+                        external_id,
+                        "user",
+                        None,
+                        message_sequence,
+                        user_content,
+                    ),
                     "kind": "message",
                     "session_id": vault_id,
                     "external_session_id": external_id,
@@ -207,6 +218,14 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         if assistant_content:
             self._spool.append(
                 {
+                    "event_id": deterministic_event_id(
+                        self._agent_instance_id,
+                        external_id,
+                        "assistant",
+                        None,
+                        message_sequence,
+                        assistant_content,
+                    ),
                     "kind": "message",
                     "session_id": vault_id,
                     "external_session_id": external_id,
@@ -223,6 +242,14 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             external_id = self._session_id or "main"
             self._spool.append(
                 {
+                    "event_id": deterministic_event_id(
+                        self._agent_instance_id,
+                        external_id,
+                        "end",
+                        None,
+                        len(messages),
+                        "session_end",
+                    ),
                     "kind": "end",
                     "session_id": self._vault_session(external_id),
                     "external_session_id": external_id,
@@ -247,6 +274,14 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         if reset and old_session:
             self._spool.append(
                 {
+                    "event_id": deterministic_event_id(
+                        self._agent_instance_id,
+                        old_session,
+                        "end",
+                        None,
+                        None,
+                        "session_reset",
+                    ),
                     "kind": "end",
                     "session_id": self._vault_session(old_session),
                     "external_session_id": old_session,
@@ -472,7 +507,8 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         agent = str(event.get("agent", "hermes")).strip()
         if not vault_id or not external_id or not agent:
             raise ValueError("missing session or agent identity")
-        self._client.start_session(vault_id, agent)
+        target_id = self._spool.redirect_for(vault_id) or vault_id
+        self._client.start_session(target_id, agent)
         if event.get("kind") == "message":
             role_value = event.get("role")
             content_value = event.get("content")
@@ -488,26 +524,38 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             metadata = dict(event.get("metadata") or {})
             try:
                 self._client.append_message(
-                    vault_id,
+                    target_id,
                     role,
                     content,
-                    metadata,
+                    (
+                        metadata
+                        if target_id == vault_id
+                        else {**metadata, "recovered_from_session": vault_id}
+                    ),
                     str(event["event_id"]),
                 )
             except VaultHttpError as exc:
                 if exc.status != 409:
                     raise
-                recovery_id = recovery_session_id(vault_id)
+                recovery_parent_id = target_id
+                recovery_id = recovery_session_id(recovery_parent_id)
                 self._client.start_session(recovery_id, agent)
+                # Make the redirect durable before the append so a process
+                # restart cannot send a later end event to the old session.
+                self._spool.record_redirect(vault_id, recovery_id)
                 self._client.append_message(
                     recovery_id,
                     role,
                     content,
-                    {**metadata, "recovered_from_session": vault_id},
+                    {
+                        **metadata,
+                        "recovered_from_session": vault_id,
+                        "recovery_parent_session": recovery_parent_id,
+                    },
                     str(event["event_id"]),
                 )
         elif event.get("kind") == "end":
-            self._client.end_session(vault_id)
+            self._client.end_session(target_id)
         else:
             raise ValueError(f"unknown spool event kind: {event.get('kind')}")
 

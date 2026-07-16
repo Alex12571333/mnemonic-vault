@@ -33,6 +33,12 @@ export type DeadLetterRecord = {
   event: SpoolEvent;
 };
 
+export type RedirectRecord = {
+  record: "redirect";
+  original_session_id: string;
+  recovery_session_id: string;
+};
+
 export class DurableSpool {
   private acknowledgements = 0;
   readonly deadLetterPath: string;
@@ -54,9 +60,12 @@ export class DurableSpool {
     chmodSync(this.deadLetterPath, 0o600);
   }
 
-  append(event: Omit<SpoolEvent, "record" | "event_id">): string {
-    const eventId = randomUUID().replaceAll("-", "");
-    this.appendRecord({ record: "event", event_id: eventId, ...event });
+  append(
+    event: Omit<SpoolEvent, "record" | "event_id"> & { event_id?: string },
+  ): string {
+    const { event_id: suppliedId, ...payload } = event;
+    const eventId = suppliedId?.trim() || randomUUID().replaceAll("-", "");
+    this.appendRecord({ record: "event", event_id: eventId, ...payload });
     return eventId;
   }
 
@@ -64,6 +73,23 @@ export class DurableSpool {
     this.appendRecord({ record: "delivered", event_id: eventId });
     this.acknowledgements += 1;
     if (this.acknowledgements >= 256) this.compact();
+  }
+
+  recordRedirect(originalSessionId: string, recoverySessionId: string): void {
+    if (this.redirectFor(originalSessionId) === recoverySessionId) return;
+    this.appendRecord({
+      record: "redirect",
+      original_session_id: originalSessionId,
+      recovery_session_id: recoverySessionId,
+    });
+  }
+
+  redirectFor(sessionId: string): string | undefined {
+    return this.scan().redirects.get(sessionId);
+  }
+
+  redirects(): Record<string, string> {
+    return Object.fromEntries(this.scan().redirects);
   }
 
   deadLetter(event: SpoolEvent, reason: string, status?: number): void {
@@ -85,7 +111,15 @@ export class DurableSpool {
   }
 
   pending(): SpoolEvent[] {
+    return [...this.scan().events.values()];
+  }
+
+  private scan(): {
+    events: Map<string, SpoolEvent>;
+    redirects: Map<string, string>;
+  } {
     const events = new Map<string, SpoolEvent>();
+    const redirects = new Map<string, string>();
     const lines = readFileSync(this.path, "utf8").split("\n");
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index].trim();
@@ -110,17 +144,34 @@ export class DurableSpool {
         } as unknown as SpoolEvent);
         continue;
       }
+      if (
+        record.record === "redirect" &&
+        typeof record.original_session_id === "string" &&
+        typeof record.recovery_session_id === "string"
+      ) {
+        redirects.set(record.original_session_id, record.recovery_session_id);
+        continue;
+      }
       const eventId = typeof record.event_id === "string" ? record.event_id : "";
       if (!eventId) continue;
       if (record.record === "event") events.set(eventId, record as SpoolEvent);
       if (record.record === "delivered") events.delete(eventId);
     }
-    return [...events.values()];
+    return { events, redirects };
   }
 
   compact(): void {
     const temporary = `${this.path}.${process.pid}.tmp`;
-    const content = this.pending().map((event) => JSON.stringify(event)).join("\n");
+    const scanned = this.scan();
+    const records: Array<RedirectRecord | SpoolEvent> = [
+      ...[...scanned.redirects].map(([originalSessionId, recoverySessionId]) => ({
+        record: "redirect" as const,
+        original_session_id: originalSessionId,
+        recovery_session_id: recoverySessionId,
+      })),
+      ...scanned.events.values(),
+    ];
+    const content = records.map((record) => JSON.stringify(record)).join("\n");
     writeFileSync(temporary, content ? `${content}\n` : "", { encoding: "utf8", mode: 0o600 });
     const descriptor = openSync(temporary, "r");
     try {

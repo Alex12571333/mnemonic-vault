@@ -193,6 +193,25 @@ def recovery_session_id(session_id: str) -> str:
     return f"session-recovery-{digest}"
 
 
+def deterministic_event_id(
+    agent_instance_id: str,
+    external_session_id: str,
+    role: str,
+    run_id: str | None,
+    message_sequence: int | None,
+    content: str,
+) -> str:
+    turn_identity = (
+        f"run:{run_id.strip()}"
+        if run_id and run_id.strip()
+        else f"sequence:{message_sequence if message_sequence is not None else 'unknown'}:content:{content}"
+    )
+    digest = hashlib.sha256(
+        f"{agent_instance_id}\0{external_session_id}\0{role}\0{turn_identity}".encode()
+    ).hexdigest()
+    return f"event-{digest[:40]}"
+
+
 def format_memory_context(value: dict[str, Any]) -> str:
     topics = value.get("topics")
     if not isinstance(topics, list):

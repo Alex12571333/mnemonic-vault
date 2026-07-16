@@ -11,6 +11,7 @@ from app.config import AppConfig
 from app.models import utc_or_local_now
 from app.evaluation import evaluate_retrieval
 from app.service import build_services
+from app.session_aliases import migrate_session_ids
 from app.storage import (
     atomic_write_json,
     estimate_tokens,
@@ -60,6 +61,20 @@ def parser() -> argparse.ArgumentParser:
     resummarize.add_argument(
         "--enqueue-only", action="store_true", help="do not call the Memory LLM now"
     )
+    migrate = commands.add_parser(
+        "migrate-session-ids",
+        help="create portable aliases from legacy process-scoped session folders",
+    )
+    migrate.add_argument(
+        "--agent-instance",
+        action="append",
+        default=[],
+        metavar="AGENT=INSTANCE",
+        help="stable installation identity override; may be repeated",
+    )
+    migrate.add_argument(
+        "--dry-run", action="store_true", help="report aliases without writing them"
+    )
     return result
 
 
@@ -86,6 +101,24 @@ def main() -> int:
         return 0
 
     config = AppConfig.load(args.config)
+    if args.command == "migrate-session-ids":
+        instances: dict[str, str] = {}
+        for raw in args.agent_instance:
+            if "=" not in raw:
+                raise SystemExit("--agent-instance must use AGENT=INSTANCE")
+            agent, instance = (part.strip() for part in raw.split("=", 1))
+            if not agent or not instance:
+                raise SystemExit("--agent-instance must use non-empty AGENT=INSTANCE")
+            instances[agent] = instance
+        print(
+            json.dumps(
+                migrate_session_ids(config, instances, dry_run=args.dry_run),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
     services = build_services(config)
     if args.command == "rebuild-index":
         print(json.dumps(services.indexer.rebuild(args.with_embeddings), ensure_ascii=False))

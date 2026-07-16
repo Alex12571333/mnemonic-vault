@@ -2,7 +2,7 @@
   "id": "mnemonic-vault",
   "name": "Mnemonic Vault",
   "description": "File-first long-term memory with automatic capture and bounded recall.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "kind": "memory",
   "activation": {
     "onStartup": false

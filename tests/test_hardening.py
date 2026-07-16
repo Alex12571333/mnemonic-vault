@@ -19,11 +19,15 @@ from app.indexer import Indexer
 from app.models import SourceRange, Topic, utc_or_local_now
 from app.recorder import SessionRecorder
 from app.retriever import ContextBuilder, Retriever, rank_messages
+from app.session_aliases import migrate_session_ids, stable_session_id
 from app.service import Services
 from app.storage import estimate_tokens, read_messages, read_session, write_topic
 from app.summarizer import JobRunner, MemorySummarizer
 from integrations.hermes.mnemonic_vault import MnemonicVaultMemoryProvider
-from integrations.hermes.mnemonic_vault.client import VaultHttpError
+from integrations.hermes.mnemonic_vault.client import (
+    VaultHttpError,
+    deterministic_event_id,
+)
 from run import validate_bind_security
 
 
@@ -182,6 +186,73 @@ class HardeningTest(unittest.TestCase):
         self.assertEqual(rebuilt["messages"], 1)
         self.assertTrue(retriever.search_transcript("DFlash error"))
 
+    def test_deterministic_adapter_event_is_idempotent_across_sessions(self):
+        first_session = self.recorder.start_session("openclaw", "session-event-a")
+        second_session = self.recorder.start_session("openclaw", "session-event-b")
+        event_id = "event-" + "a" * 40
+        first = self.recorder.append(
+            first_session.id,
+            "user",
+            "one durable agent turn",
+            external_event_id=event_id,
+        )
+        repeated = self.recorder.append(
+            second_session.id,
+            "user",
+            "one durable agent turn",
+            external_event_id=event_id,
+        )
+        self.assertEqual(repeated.id, first.id)
+        self.assertEqual(
+            read_messages(self.recorder.locate(second_session.id) / "transcript.jsonl"),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "different content"):
+            self.recorder.append(
+                second_session.id,
+                "user",
+                "collision",
+                external_event_id=event_id,
+            )
+
+    def test_legacy_session_aliases_preserve_files_and_scope_transcript_search(self):
+        external_id = "agent:main:telegram:direct:42"
+        session_ids = ["session-openclaw-pid-100", "session-openclaw-pid-200"]
+        before: dict[str, bytes] = {}
+        for index, session_id in enumerate(session_ids, 1):
+            session = self.recorder.start_session(
+                "openclaw", session_id, f"2026-0{index}-01T10:00:00+09:00"
+            )
+            self.recorder.append(
+                session.id,
+                "user",
+                f"legacy DFlash fragment {index}",
+                metadata={"external_session_id": external_id},
+            )
+            transcript = self.recorder.locate(session.id) / "transcript.jsonl"
+            before[session.id] = transcript.read_bytes()
+
+        dry_run = migrate_session_ids(self.config, dry_run=True)
+        self.assertEqual(dry_run["alias_groups"], 1)
+        self.assertFalse((self.config.storage.root / "session-aliases.json").exists())
+        report = migrate_session_ids(self.config)
+        canonical = stable_session_id(external_id, "openclaw", "openclaw-main")
+        self.assertEqual(report["aliases"][0]["canonical_session_id"], canonical)
+        self.assertEqual(
+            report["aliases"][0]["member_session_ids"], session_ids
+        )
+        for session_id in session_ids:
+            transcript = self.recorder.locate(session_id) / "transcript.jsonl"
+            self.assertEqual(transcript.read_bytes(), before[session_id])
+
+        retriever = Retriever(self.config, self.catalog, self.recorder)
+        hits = retriever.search_transcript("legacy DFlash fragment", canonical)
+        self.assertEqual({hit["session_id"] for hit in hits}, set(session_ids))
+        client = TestClient(create_app(services=self._services()))
+        response = client.get(f"/v1/sessions/{canonical}/aliases")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["member_session_ids"], session_ids)
+
     def test_idempotent_retry_recovers_session_metadata_after_index_crash(self):
         session = self.recorder.start_session("openclaw", "session-index-crash")
         original = self.catalog.index_message
@@ -282,6 +353,14 @@ class HardeningTest(unittest.TestCase):
             "DFlash launch раньше"
         )
         self.assertEqual({hit.topic.id for hit in historical}, {old.id, new.id})
+        dated = Retriever(self.config, self.catalog, self.recorder).search(
+            "Какой DFlash launch мы использовали в 2026 году?"
+        )
+        self.assertEqual([hit.topic.id for hit in dated], [old.id])
+        missing_date = Retriever(self.config, self.catalog, self.recorder).search(
+            "Какой DFlash launch мы использовали в 2025 году?"
+        )
+        self.assertEqual(missing_date, [])
         self.assertTrue(old_path.exists())
 
     def test_token_estimate_is_conservative_for_russian_fallback(self):
@@ -553,6 +632,23 @@ class FinalizedThenRecoveryClient(RecordingClient):
 
 
 class SpoolRecoveryTest(unittest.TestCase):
+    def test_deterministic_hermes_event_identity_survives_reemission(self):
+        first = deterministic_event_id(
+            "hermes-main", "chat-42", "user", None, 12, "same turn"
+        )
+        self.assertEqual(
+            first,
+            deterministic_event_id(
+                "hermes-main", "chat-42", "user", None, 12, "same turn"
+            ),
+        )
+        self.assertNotEqual(
+            first,
+            deterministic_event_id(
+                "hermes-main", "chat-42", "user", None, 14, "same turn"
+            ),
+        )
+
     def test_hermes_replays_spool_after_process_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             spool = Path(temporary) / "hermes.jsonl"
@@ -663,6 +759,46 @@ class SpoolRecoveryTest(unittest.TestCase):
             self.assertEqual(len(messages), 1)
             self.assertTrue(messages[0][1].startswith("session-recovery-"))
             self.assertIn("recovered_from_session", messages[0][3])
+
+    def test_recovery_redirect_survives_restart_and_closes_recovery_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spool_path = Path(temporary) / "hermes.jsonl"
+            client = FinalizedThenRecoveryClient()
+            provider = MnemonicVaultMemoryProvider(
+                client=client, spool_path=spool_path
+            )
+            message = {
+                "event_id": "event-" + "b" * 40,
+                "kind": "message",
+                "session_id": "session-finalized",
+                "external_session_id": "external-a",
+                "agent": "hermes",
+                "role": "user",
+                "content": "late durable turn",
+            }
+            provider._deliver(message)
+            recovery_id = provider._spool.redirect_for("session-finalized")
+            self.assertIsNotNone(recovery_id)
+            provider._spool.compact()
+            provider.shutdown()
+
+            restarted = MnemonicVaultMemoryProvider(
+                client=client, spool_path=spool_path
+            )
+            self.assertEqual(
+                restarted._spool.redirect_for("session-finalized"), recovery_id
+            )
+            restarted._deliver(
+                {
+                    "event_id": "event-" + "c" * 40,
+                    "kind": "end",
+                    "session_id": "session-finalized",
+                    "external_session_id": "external-a",
+                    "agent": "hermes",
+                }
+            )
+            restarted.shutdown()
+            self.assertIn(("end", recovery_id), client.events)
 
 
 if __name__ == "__main__":

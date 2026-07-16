@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -14,6 +13,7 @@ import {
   extractLastAssistant,
   formatMemoryContext,
   type IncludeSources,
+  deterministicEventId,
   recoverySessionId,
   VaultClient,
   VaultHttpError,
@@ -137,8 +137,10 @@ export async function flushDurableSpool(
       if (!event.session_id || !event.external_session_id || !event.agent) {
         throw new InvalidSpoolEventError("missing session or agent identity");
       }
+      const originalSessionId = event.session_id;
+      let targetSessionId = spool.redirectFor(originalSessionId) ?? originalSessionId;
       await client.startSession(
-        event.session_id,
+        targetSessionId,
         event.agent,
         event.external_session_id,
       );
@@ -148,29 +150,40 @@ export async function flushDurableSpool(
         }
         try {
           await client.appendMessage(
-            event.session_id,
+            targetSessionId,
             event.role,
             event.content,
-            event.metadata ?? {},
+            targetSessionId === originalSessionId
+              ? (event.metadata ?? {})
+              : {
+                  ...(event.metadata ?? {}),
+                  recovered_from_session: originalSessionId,
+                },
             event.event_id,
           );
         } catch (error) {
           if (!(error instanceof VaultHttpError) || error.status !== 409) throw error;
-          const recoveryId = recoverySessionId(event.session_id);
+          const recoveryParentSession = targetSessionId;
+          const recoveryId = recoverySessionId(recoveryParentSession);
           await client.startSession(recoveryId, event.agent, event.external_session_id);
+          // Persist the redirect before the recovered append. If the process
+          // stops after the append, a replay still targets the recovery chain.
+          spool.recordRedirect(originalSessionId, recoveryId);
+          targetSessionId = recoveryId;
           await client.appendMessage(
             recoveryId,
             event.role,
             event.content,
             {
               ...(event.metadata ?? {}),
-              recovered_from_session: event.session_id,
+              recovered_from_session: originalSessionId,
+              recovery_parent_session: recoveryParentSession,
             },
             event.event_id,
           );
         }
       } else if (event.kind === "end") {
-        await client.endSession(event.session_id);
+        await client.endSession(targetSessionId);
       } else {
         throw new InvalidSpoolEventError(`unknown event kind: ${String(event.kind)}`);
       }
@@ -274,9 +287,6 @@ export default definePluginEntry({
       }
       return true;
     };
-
-    const captureKey = (role: string, externalId: string, runId: string | undefined, text: string) =>
-      `${role}:${externalId}:${runId ?? createHash("sha256").update(text).digest("hex").slice(0, 20)}`;
 
     api.registerTool({
       name: "memory_search",
@@ -414,10 +424,18 @@ export default definePluginEntry({
       async (event, ctx) => {
         const externalId = externalSession(ctx);
         if (config.autoCapture && event.prompt.trim()) {
-          const key = captureKey("user", externalId, ctx.runId, event.prompt);
-          if (markCaptured(key)) {
+          const eventId = deterministicEventId(
+            config.agentInstanceId,
+            externalId,
+            "user",
+            ctx.runId,
+            event.messages.length,
+            event.prompt,
+          );
+          if (markCaptured(eventId)) {
             const vaultId = vaultSession(externalId);
             spool!.append({
+              event_id: eventId,
               kind: "message",
               session_id: vaultId,
               external_session_id: externalId,
@@ -427,6 +445,7 @@ export default definePluginEntry({
               metadata: {
                 source: "openclaw-plugin",
                 external_session_id: externalId,
+                agent_instance_id: config.agentInstanceId,
                 run_id: ctx.runId ?? "",
               },
             });
@@ -456,10 +475,18 @@ export default definePluginEntry({
       const content = extractLastAssistant(event.messages);
       if (!content) return;
       const externalId = externalSession(ctx);
-      const key = captureKey("assistant", externalId, event.runId ?? ctx.runId, content);
-      if (!markCaptured(key)) return;
+      const eventId = deterministicEventId(
+        config.agentInstanceId,
+        externalId,
+        "assistant",
+        event.runId ?? ctx.runId,
+        event.messages.length,
+        content,
+      );
+      if (!markCaptured(eventId)) return;
       const vaultId = vaultSession(externalId);
       spool!.append({
+        event_id: eventId,
         kind: "message",
         session_id: vaultId,
         external_session_id: externalId,
@@ -469,6 +496,7 @@ export default definePluginEntry({
         metadata: {
           source: "openclaw-plugin",
           external_session_id: externalId,
+          agent_instance_id: config.agentInstanceId,
           run_id: event.runId ?? ctx.runId ?? "",
         },
       });
@@ -479,7 +507,16 @@ export default definePluginEntry({
       if (!config.autoCapture) return;
       const externalId = externalSession({ ...event, ...ctx });
       const vaultId = vaultSession(externalId);
+      const eventId = deterministicEventId(
+        config.agentInstanceId,
+        externalId,
+        "end",
+        undefined,
+        event.messageCount,
+        "session_end",
+      );
       spool!.append({
+        event_id: eventId,
         kind: "end",
         session_id: vaultId,
         external_session_id: externalId,

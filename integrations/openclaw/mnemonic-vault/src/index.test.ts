@@ -5,7 +5,9 @@ import { join } from "node:path";
 
 import entry, { flushDurableSpool } from "./index.js";
 import {
+  deterministicEventId,
   formatMemoryContext,
+  recoverySessionId,
   VaultHttpError,
   vaultSessionId,
 } from "./client.js";
@@ -67,6 +69,46 @@ describe("mnemonic-vault OpenClaw plugin", () => {
     ).not.toBe(value);
   });
 
+  it("creates deterministic event identities across hook re-emission", () => {
+    const first = deterministicEventId(
+      "openclaw-main",
+      "chat-42",
+      "user",
+      "run-123",
+      10,
+      "same turn",
+    );
+    expect(
+      deterministicEventId(
+        "openclaw-main",
+        "chat-42",
+        "user",
+        "run-123",
+        99,
+        "different rendering",
+      ),
+    ).toBe(first);
+    expect(
+      deterministicEventId(
+        "openclaw-main",
+        "chat-42",
+        "user",
+        undefined,
+        12,
+        "same turn",
+      ),
+    ).not.toBe(
+      deterministicEventId(
+        "openclaw-main",
+        "chat-42",
+        "user",
+        undefined,
+        14,
+        "same turn",
+      ),
+    );
+  });
+
   it("renders bounded memory as untrusted reference context", () => {
     const rendered = formatMemoryContext({
       topics: [
@@ -91,6 +133,7 @@ describe("mnemonic-vault OpenClaw plugin", () => {
       const path = join(directory, "openclaw.jsonl");
       const spool = new DurableSpool(path);
       const first = spool.append({
+        event_id: "event-stable-first",
         kind: "message",
         session_id: "session-a",
         external_session_id: "external-a",
@@ -107,6 +150,7 @@ describe("mnemonic-vault OpenClaw plugin", () => {
         content: "durable second",
       });
       spool.acknowledge(first);
+      expect(first).toBe("event-stable-first");
 
       const recovered = new DurableSpool(path);
       expect(recovered.pending().map((event) => event.content)).toEqual([
@@ -247,6 +291,54 @@ describe("mnemonic-vault OpenClaw plugin", () => {
       expect(await flushDurableSpool(spool, client, { warn() {} })).toBe("drained");
       expect(delivered).toHaveLength(1);
       expect(delivered[0]?.metadata.recovered_from_session).toBe("session-finalized");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("persists a recovery redirect and closes the recovery session", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mnemonic-vault-recovery-end-"));
+    try {
+      const path = join(directory, "openclaw.jsonl");
+      const spool = new DurableSpool(path);
+      spool.append({
+        event_id: "event-late-message",
+        kind: "message",
+        session_id: "session-finalized",
+        external_session_id: "external-a",
+        agent: "openclaw",
+        role: "user",
+        content: "late message",
+      });
+      spool.append({
+        event_id: "event-late-end",
+        kind: "end",
+        session_id: "session-finalized",
+        external_session_id: "external-a",
+        agent: "openclaw",
+      });
+      const ended: string[] = [];
+      const client = {
+        async startSession() {},
+        async appendMessage(session: string) {
+          if (session === "session-finalized") {
+            throw new VaultHttpError(409, "finalized");
+          }
+          return {};
+        },
+        async endSession(session: string) {
+          ended.push(session);
+          return {};
+        },
+      };
+      expect(await flushDurableSpool(spool, client, { warn() {} })).toBe("drained");
+      const expectedRecovery = recoverySessionId("session-finalized");
+      expect(ended).toEqual([expectedRecovery]);
+      expect(spool.redirectFor("session-finalized")).toBe(expectedRecovery);
+      spool.compact();
+      expect(new DurableSpool(path).redirectFor("session-finalized")).toBe(
+        expectedRecovery,
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
