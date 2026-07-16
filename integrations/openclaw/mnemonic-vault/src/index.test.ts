@@ -177,6 +177,33 @@ describe("mnemonic-vault OpenClaw plugin", () => {
     });
   });
 
+  it("searches the shared archive with boost by default and forwards strict mode", async () => {
+    let body: Record<string, unknown> = {};
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response('{"topics":[],"explicit_memories":[]}', { status: 200 });
+    }) as typeof fetch;
+    const client = new VaultClient("http://vault.local", 8_000, "", fetchImpl);
+    await client.search("where is production", {
+      scope: { type: "project", id: "vault" },
+      contextScopes: [
+        { type: "agent", id: "openclaw-main" },
+        { type: "session", id: "session-current" },
+      ],
+      scopeMode: "strict",
+      includeAllScopes: true,
+    });
+    expect(body).toMatchObject({
+      scope: { type: "project", id: "vault" },
+      context_scopes: [
+        { type: "agent", id: "openclaw-main" },
+        { type: "session", id: "session-current" },
+      ],
+      scope_mode: "strict",
+      include_all_scopes: true,
+    });
+  });
+
   it("routes slash remember directly without an agent turn", async () => {
     const originalFetch = globalThis.fetch;
     let requestedPath = "";
@@ -216,6 +243,38 @@ describe("mnemonic-vault OpenClaw plugin", () => {
         verbatim: "Production runs on .14",
         scope: { type: "project", id: "mnemonic-vault" },
       });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("uses global scope for an unqualified slash remember", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestedBody: Record<string, unknown> = {};
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestedBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(
+        '{"stored":true,"memory_id":"mem-global","available_for_recall":true}',
+        { status: 201 },
+      );
+    }) as typeof fetch;
+    try {
+      let command: { handler(ctx: Record<string, unknown>): Promise<{ text: string }> } | undefined;
+      const api = {
+        pluginConfig: { autoCapture: false, autoRecall: false, baseUrl: "http://vault.local" },
+        registerTool() {},
+        registerCommand(value: typeof command) {
+          command = value;
+        },
+        on() {},
+        logger: { warn() {} },
+      };
+      (entry as unknown as { register(api: unknown): void }).register(api);
+      await command!.handler({
+        args: "Я предпочитаю русский язык",
+        sessionKey: "chat-42",
+      });
+      expect(requestedBody.scope).toEqual({ type: "global" });
     } finally {
       globalThis.fetch = originalFetch;
     }

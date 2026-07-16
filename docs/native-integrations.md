@@ -1,6 +1,6 @@
 # Native OpenClaw and Hermes integrations
 
-Mnemonic Vault 0.5.0 ships two native adapters. Both use the same loopback HTTP
+Mnemonic Vault 0.5.1 ships two native adapters. Both use the same loopback HTTP
 API, expose the same eight memory tools, automatically record completed turns, and
 inject only a bounded amount of retrieved history. Retrieval stays
 non-generative; the Memory LLM continues to run only in the background
@@ -37,6 +37,15 @@ checked against current live state.
 `memory_remember` is only for an explicit user command. OpenClaw additionally
 registers `/remember`, which bypasses the LLM entirely; the server also exposes
 `POST /v1/memory/remember` and the local `python run.py remember` command.
+An unqualified remember is global. Use a narrower scope only for genuinely
+project-, agent-, or session-specific information.
+
+All adapters search one shared Vault. Their stable agent and current session are
+sent as `context_scopes`; an optional project comes from OpenClaw `projectId` or
+Hermes `MNEMONIC_VAULT_PROJECT_ID`. The default `scope_mode=boost` never hides
+another agent's memory. `scope_mode=strict` is reserved for an explicit scoped
+search, while `include_all_scopes=true` removes the ordinary foreign-session
+downrank for broad historical recall.
 
 ## OpenClaw memory-slot plugin
 

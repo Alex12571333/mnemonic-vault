@@ -14,8 +14,9 @@ LLM-bypass command:
 /remember project:mnemonic-vault Production runs on 192.168.0.14
 ```
 
-Without an explicit scope selector, `/remember` uses the current OpenClaw agent
-installation scope (`agent:openclaw-main`).
+Without an explicit scope selector, `/remember` uses `global`, so other agents can
+recall it with normal semantic search. Use agent/project/session selectors only for
+context-specific facts.
 
 Requires OpenClaw 2026.7.1 or newer and a reachable Mnemonic Vault API.
 
@@ -41,3 +42,9 @@ variable name.
 a distinct value for each independent OpenClaw installation. Permanent delivery
 failures are preserved in `openclaw.dead-letter.jsonl`; retryable failures remain in
 the primary spool.
+
+Recall searches the shared archive with `scope_mode=boost`. The plugin always sends
+its stable agent ID and current Vault session as context, and also sends `projectId`
+when configured. Other agents and projects remain visible. Use tool
+`scope_mode=strict` only for an explicitly requested scope; use
+`include_all_scopes=true` for broad historical search without session downranking.

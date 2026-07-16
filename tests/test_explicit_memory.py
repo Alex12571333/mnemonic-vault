@@ -268,6 +268,73 @@ class ExplicitMemoryTest(unittest.TestCase):
         self.assertEqual(rebuilt["explicit_memories"], 2)
         self.assertEqual(self.store.get(old["memory_id"]).status, "superseded")
 
+    def test_shared_scope_search_boosts_context_and_only_strict_filters(self):
+        memories: dict[str, str] = {}
+        cases = [
+            ("global", None, "global"),
+            ("project", "proj-current", "current-project"),
+            ("project", "proj-other", "other-project"),
+            ("agent", "openclaw-main", "current-agent"),
+            ("agent", "hermes-main", "other-agent"),
+            ("session", "session-current", "current-session"),
+            ("session", "session-other", "other-session"),
+        ]
+        for index, (scope_type, scope_id, label) in enumerate(cases, start=1):
+            receipt = self.store.remember(
+                f"alpha shared-memory marker {label}",
+                kind="fact",
+                scope_type=scope_type,
+                scope_id=scope_id,
+                idempotency_key=f"event-scope-ranking-{label}",
+                created_at=f"2026-07-16T21:{index:02d}:00+09:00",
+            )
+            memories[label] = receipt["memory_id"]
+
+        context = [
+            ("project", "proj-current"),
+            ("agent", "openclaw-main"),
+            ("session", "session-current"),
+        ]
+        boosted = self.store.search(
+            "alpha beta gamma delta",
+            limit=20,
+            context_scopes=context,
+        )
+        scores = {item["memory_id"]: item["score"] for item in boosted}
+        self.assertEqual(set(scores), set(memories.values()))
+        self.assertGreater(scores[memories["current-project"]], scores[memories["other-project"]])
+        self.assertGreater(scores[memories["current-agent"]], scores[memories["other-agent"]])
+        self.assertGreater(scores[memories["current-session"]], scores[memories["other-session"]])
+        self.assertIn(memories["other-agent"], scores)
+        self.assertIn(memories["other-project"], scores)
+
+        broad = self.store.search(
+            "alpha beta gamma delta",
+            limit=20,
+            context_scopes=context,
+            include_all_scopes=True,
+        )
+        broad_scores = {item["memory_id"]: item["score"] for item in broad}
+        self.assertGreater(
+            broad_scores[memories["other-session"]],
+            scores[memories["other-session"]],
+        )
+
+        strict = self.store.search(
+            "alpha beta gamma delta",
+            limit=20,
+            scope_type="project",
+            scope_id="proj-current",
+            context_scopes=context,
+            scope_mode="strict",
+        )
+        self.assertEqual(
+            [item["memory_id"] for item in strict],
+            [memories["current-project"]],
+        )
+        with self.assertRaisesRegex(ValueError, "strict scope search requires"):
+            self.store.search("alpha", scope_mode="strict")
+
     def test_reembed_all_adds_optional_semantic_recall_after_the_commit(self):
         receipt = self.store.remember(
             "Production Mnemonic Vault работает на 192.168.0.14",
@@ -327,6 +394,38 @@ class ExplicitMemoryTest(unittest.TestCase):
             )
             self.assertEqual(searched.status_code, 200)
             self.assertEqual(searched.json()["explicit_memories"][0]["memory_id"], memory_id)
+            self.assertEqual(searched.json()["scope_mode"], "boost")
+
+            project = client.post(
+                "/v1/memory/remember",
+                json={
+                    "verbatim": "Ответы проекта на русском",
+                    "kind": "preference",
+                    "scope": {"type": "project", "id": "vault"},
+                    "idempotency_key": "event-project-language-russian",
+                },
+            ).json()
+            strict = client.post(
+                "/v1/memory/search",
+                json={
+                    "query": "ответы на русском",
+                    "scope": {"type": "project", "id": "vault"},
+                    "context_scopes": [
+                        {"type": "agent", "id": "openclaw-main"}
+                    ],
+                    "scope_mode": "strict",
+                },
+            )
+            self.assertEqual(strict.status_code, 200)
+            self.assertEqual(
+                [item["memory_id"] for item in strict.json()["explicit_memories"]],
+                [project["memory_id"]],
+            )
+            missing_scope = client.post(
+                "/v1/memory/search",
+                json={"query": "ответы", "scope_mode": "strict"},
+            )
+            self.assertEqual(missing_scope.status_code, 422)
 
 
 if __name__ == "__main__":

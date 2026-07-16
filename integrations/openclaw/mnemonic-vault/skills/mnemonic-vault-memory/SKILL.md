@@ -12,7 +12,9 @@ Mnemonic Vault automatically supplies a small relevant context before ordinary t
 When the user directly says “remember”, “save this”, “do not forget”, “keep this for
 the future”, or the equivalent in another language, call `memory_remember` before
 claiming that the fact was stored. Copy the user's exact words into `verbatim`; put any
-search-friendly rendering in `normalized`. Choose the narrowest correct scope.
+search-friendly rendering in `normalized`. Use `global` for ordinary user preferences
+and facts shared across agents. Choose project, agent, or session only when the fact is
+genuinely context-specific.
 
 Do not call `memory_remember` merely because a detail seems useful. In this version,
 only a direct user request authorizes explicit memory. Never infer or create a global
@@ -29,6 +31,10 @@ the old fact. A successful receipt must say `available_for_recall: true`.
 6. Use `memory_read_turns` only for a known source range. Use `memory_search_transcript` when no topic has enough detail.
 
 Set `include_sources` to `always` for exact-value requests and to `auto` otherwise. Keep `max_topics` small unless the request explicitly spans several projects.
+Search uses the shared archive with `scope_mode=boost` by default. Other agents' and
+projects' memories remain visible. Use `scope_mode=strict` only when the user explicitly
+requests one scope, and `include_all_scopes=true` for a broad historical search that
+must not downrank other sessions.
 
 ## Evidence rules
 

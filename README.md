@@ -153,10 +153,45 @@ python run.py remember "Production работает на 192.168.0.14" \
 ```
 
 OpenClaw также поддерживает `/remember`. Без selector команда использует scope
-`agent:openclaw-main`; selector можно задать явно:
+`global`; более узкий selector задаётся явно:
 
 ```text
 /remember project:mnemonic-vault Production работает на 192.168.0.14
+```
+
+## Общая память и scope-aware ranking
+
+Все агенты читают один архив, один `explicit-memory.jsonl` и один SQLite-каталог.
+Scope — метка релевантности, а не граница доступа. По умолчанию
+`scope_mode=boost`: совпавший project получает `+0.12`, текущая session `+0.10`,
+текущий agent `+0.08`, global `+0.05`. Другие project/agent записи остаются
+обычными кандидатами; чужая session получает сильное понижение, но не скрывается.
+
+Автоматический recall OpenClaw и Hermes передаёт свои стабильные agent/session
+scope. Необязательный project задаётся через OpenClaw `projectId` или Hermes
+`MNEMONIC_VAULT_PROJECT_ID`.
+
+```json
+{
+  "query": "Где production Vault?",
+  "context_scopes": [
+    {"type": "agent", "id": "openclaw-main"},
+    {"type": "project", "id": "mnemonic-vault"},
+    {"type": "session", "id": "session-openclaw-..."}
+  ],
+  "scope_mode": "boost"
+}
+```
+
+`include_all_scopes=true` отключает понижение чужих session-записей для явного
+широкого исторического поиска. Настоящая фильтрация включается только явно:
+
+```json
+{
+  "query": "production",
+  "scope": {"type": "project", "id": "mnemonic-vault"},
+  "scope_mode": "strict"
+}
 ```
 
 ## Надёжная доставка
@@ -258,7 +293,7 @@ python run.py rebuild-global-topics
 
 ## Нативные интеграции агентов
 
-Версия 0.5.0 включает два lossless-адаптера:
+Версия 0.5.1 включает два lossless-адаптера:
 
 - OpenClaw memory-slot plugin с lifecycle hooks, восемью memory tools,
   гарантированной `/remember` command и встроенным skill;
