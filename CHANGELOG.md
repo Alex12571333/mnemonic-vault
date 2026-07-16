@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-07-16
+
+- Choose the latest global-topic snapshot by `topic.updated_at` while retaining the
+  original session-based identity anchor for stable global IDs.
+- Build projections only from finalized sessions whose messages are fully processed.
+- Replace union-find single-linkage clustering with deterministic complete-link
+  assignment so similarity chains cannot merge unrelated topic endpoints.
+- Label `current.md` as the latest session snapshot rather than a synthesized current
+  state, and show both topic-update and session-start dates in the timeline.
+- Enforce one `total_token_budget` across snapshot, timeline, sources, and metadata in
+  the API and the OpenClaw/Hermes `memory_open_global_topic` tool.
+
 ## 0.4.0 — 2026-07-16
 
 - Add an optional, rebuildable global-topic layer over immutable session summaries.

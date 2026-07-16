@@ -98,14 +98,19 @@ class VaultClient:
         )
 
     def open_global_topic(
-        self, global_topic_id: str, *, max_timeline_entries: int = 50
+        self,
+        global_topic_id: str,
+        *,
+        max_timeline_entries: int = 50,
+        total_token_budget: int | None = None,
     ) -> dict[str, Any]:
+        parameters = {"max_timeline_entries": str(max_timeline_entries)}
+        if total_token_budget is not None:
+            parameters["total_token_budget"] = str(total_token_budget)
         return self._request(
             "/v1/memory/global-topics/"
             f"{urllib.parse.quote(global_topic_id, safe='')}?"
-            + urllib.parse.urlencode(
-                {"max_timeline_entries": str(max_timeline_entries)}
-            )
+            + urllib.parse.urlencode(parameters)
         )
 
     def expand_topic(

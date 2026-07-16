@@ -102,9 +102,21 @@ class HermesProviderTests(unittest.TestCase):
             self.assertEqual(opened, {"id": "topic-a"})
             opened_global = json.loads(provider.handle_tool_call(
                 "memory_open_global_topic",
-                {"global_topic_id": "global-a", "max_timeline_entries": 20},
+                {
+                    "global_topic_id": "global-a",
+                    "max_timeline_entries": 20,
+                    "total_token_budget": 640,
+                },
             ))
             self.assertEqual(opened_global, {"id": "global-a"})
+            self.assertEqual(
+                client.calls[-1],
+                (
+                    "open-global",
+                    "global-a",
+                    {"max_timeline_entries": 20, "total_token_budget": 640},
+                ),
+            )
             provider.shutdown()
 
     def test_manifest_and_bundled_skill_match_sources(self):
@@ -116,7 +128,7 @@ class HermesProviderTests(unittest.TestCase):
         manifest = json.loads((root / "integrations/openclaw/mnemonic-vault/"
                                       "openclaw.plugin.json").read_text())
         self.assertEqual(manifest["kind"], "memory")
-        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertEqual(manifest["version"], "0.4.1")
         self.assertEqual(len(manifest["contracts"]["tools"]), 7)
 
 

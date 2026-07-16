@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ from .storage import (
     atomic_write_json,
     atomic_write_text,
     exclusive_lock,
+    estimate_tokens,
     read_json,
     read_session,
     read_topic,
@@ -23,6 +25,7 @@ from .storage import (
 
 
 WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
+INDEX_VERSION = 2
 STOP_WORDS = {
     "a",
     "and",
@@ -77,11 +80,21 @@ class GlobalTopicStore:
         ]
 
     def get(
-        self, global_topic_id: str, max_timeline_entries: int = 50
+        self,
+        global_topic_id: str,
+        max_timeline_entries: int = 50,
+        total_token_budget: int | None = None,
     ) -> dict[str, Any]:
         validate_id(global_topic_id, "global topic id")
         if not 1 <= max_timeline_entries <= 500:
             raise ValueError("max_timeline_entries must be between 1 and 500")
+        token_budget = (
+            self.config.global_topics.total_token_budget
+            if total_token_budget is None
+            else total_token_budget
+        )
+        if not 300 <= token_budget <= 32_000:
+            raise ValueError("total_token_budget must be between 300 and 32000")
         entry = next(
             (
                 item
@@ -98,35 +111,162 @@ class GlobalTopicStore:
         timeline_lines = timeline.splitlines()
         heading = [line for line in timeline_lines if not line.startswith("- **")]
         entries = [line for line in timeline_lines if line.startswith("- **")]
-        omitted = max(0, len(entries) - max_timeline_entries)
-        bounded_entries = entries[-max_timeline_entries:]
-        bounded_timeline = "\n".join(
+        maximum = min(
+            max_timeline_entries,
+            len(entries),
+            len(sources.get("topic_ids", [])),
+            len(sources.get("sources", [])),
+        )
+        current = (path / "current.md").read_text(encoding="utf-8")
+        selected = maximum
+        response = self._open_response(
+            entry, sources, heading, entries, current, selected
+        )
+        # Reserve deterministic allowance for usage metadata and truncation flags.
+        content_budget = max(1, token_budget - 64)
+        while selected > 0 and self._response_cost(response) > content_budget:
+            selected -= 1
+            response = self._open_response(
+                entry, sources, heading, entries, current, selected
+            )
+        if self._response_cost(response) > content_budget:
+            current = self._truncate_current_to_budget(
+                entry,
+                sources,
+                heading,
+                entries,
+                current,
+                selected,
+                content_budget,
+            )
+            response = self._open_response(
+                entry, sources, heading, entries, current, selected
+            )
+            response["truncated_to_token_budget"] = True
+        if selected < maximum:
+            response["truncated_to_token_budget"] = True
+        response = self._add_usage(response, token_budget)
+        if self._response_cost(response) > token_budget:
+            response = self._compact_budget_response(entry, token_budget)
+        return response
+
+    def _add_usage(
+        self, response: dict[str, Any], token_budget: int
+    ) -> dict[str, Any]:
+        response["total_token_budget"] = token_budget
+        for _ in range(3):
+            response["used_tokens"] = self._response_cost(response)
+        return response
+
+    def _compact_budget_response(
+        self, entry: dict[str, Any], token_budget: int
+    ) -> dict[str, Any]:
+        source_count = int(entry.get("source_count", 0))
+        response: dict[str, Any] = {
+            "id": entry["id"],
+            "current_topic_id": entry["current_topic_id"],
+            "source_count": source_count,
+            "topic_ids": [],
+            "older_topic_ids_omitted": source_count,
+            "current": "",
+            "timeline": "",
+            "sources": {
+                "global_topic_id": entry["id"],
+                "current_topic_id": entry["current_topic_id"],
+                "topic_ids": [],
+                "sources": [],
+                "older_sources_omitted": source_count,
+            },
+            "truncated_to_token_budget": True,
+        }
+        response = self._add_usage(response, token_budget)
+        if self._response_cost(response) <= token_budget:
+            return response
+        minimal = {
+            "id": entry["id"],
+            "current_topic_id": entry["current_topic_id"],
+            "source_count": source_count,
+            "current": "",
+            "timeline": "",
+            "sources": {},
+            "truncated_to_token_budget": True,
+        }
+        return self._add_usage(minimal, token_budget)
+
+    def _open_response(
+        self,
+        entry: dict[str, Any],
+        sources: dict[str, Any],
+        heading: list[str],
+        timeline_entries: list[str],
+        current: str,
+        selected: int,
+    ) -> dict[str, Any]:
+        total = len(timeline_entries)
+        omitted = max(0, total - selected)
+        selected_entries = timeline_entries[-selected:] if selected else []
+        timeline = "\n".join(
             [
                 *heading,
                 *(([f"- _{omitted} older entries omitted_"]) if omitted else []),
-                *bounded_entries,
+                *selected_entries,
             ]
         ).rstrip() + "\n"
         bounded_sources = dict(sources)
-        bounded_sources["topic_ids"] = list(sources.get("topic_ids", []))[
-            -max_timeline_entries:
-        ]
-        bounded_sources["sources"] = list(sources.get("sources", []))[
-            -max_timeline_entries:
-        ]
+        bounded_sources["topic_ids"] = (
+            list(sources.get("topic_ids", []))[-selected:] if selected else []
+        )
+        bounded_sources["sources"] = (
+            list(sources.get("sources", []))[-selected:] if selected else []
+        )
         bounded_entry = dict(entry)
-        bounded_entry["topic_ids"] = list(entry.get("topic_ids", []))[
-            -max_timeline_entries:
-        ]
+        bounded_entry["topic_ids"] = (
+            list(entry.get("topic_ids", []))[-selected:] if selected else []
+        )
         if omitted:
             bounded_sources["older_sources_omitted"] = omitted
             bounded_entry["older_topic_ids_omitted"] = omitted
         return {
             **bounded_entry,
-            "current": (path / "current.md").read_text(encoding="utf-8"),
-            "timeline": bounded_timeline,
+            "current": current,
+            "timeline": timeline,
             "sources": bounded_sources,
         }
+
+    def _truncate_current_to_budget(
+        self,
+        entry: dict[str, Any],
+        sources: dict[str, Any],
+        heading: list[str],
+        timeline_entries: list[str],
+        current: str,
+        selected: int,
+        token_budget: int,
+    ) -> str:
+        marker = "\n[latest snapshot truncated to token budget]\n"
+        low, high = 0, len(current)
+        best = ""
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = current[:middle] + marker
+            response = self._open_response(
+                entry,
+                sources,
+                heading,
+                timeline_entries,
+                candidate,
+                selected,
+            )
+            if self._response_cost(response) <= token_budget:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    @staticmethod
+    def _response_cost(response: dict[str, Any]) -> int:
+        return estimate_tokens(json.dumps(response, ensure_ascii=False))
 
     def topic_mapping(self) -> dict[str, str]:
         if not self.index_path.exists():
@@ -204,6 +344,11 @@ class GlobalTopicStore:
             self.config.storage.sessions_dir.glob("*/*/*/session.json")
         ):
             session = read_session(session_file.parent)
+            if (
+                session.status != "finalized"
+                or session.processed_until_message != session.message_count
+            ):
+                continue
             for topic_file in sorted((session_file.parent / "topics").glob("*.md")):
                 topic = read_topic(topic_file)
                 result.append(
@@ -231,49 +376,54 @@ class GlobalTopicStore:
     def _cluster(self, sources: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         if not sources:
             return []
-        parent = list(range(len(sources)))
-        sessions = [{sources[index]["topic"].session_id} for index in range(len(sources))]
-
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
-
-        def union(left: int, right: int) -> None:
-            left_root = find(left)
-            right_root = find(right)
-            if left_root == right_root or sessions[left_root] & sessions[right_root]:
-                return
-            parent[right_root] = left_root
-            sessions[left_root] |= sessions[right_root]
-
-        inverted: dict[str, list[int]] = defaultdict(list)
-        compared: set[tuple[int, int]] = set()
-        for index, source in enumerate(sources):
+        clusters: list[list[dict[str, Any]]] = []
+        cluster_sessions: list[set[str]] = []
+        inverted: dict[str, set[int]] = defaultdict(set)
+        for source in sources:
             candidates: set[int] = set()
             for token in source["title_tokens"]:
                 candidates.update(inverted[token])
-            for candidate in candidates:
-                pair = (candidate, index)
-                if pair in compared:
-                    continue
-                compared.add(pair)
-                if self._matches(sources[candidate], source):
-                    union(candidate, index)
+            compatible = [
+                cluster_index
+                for cluster_index in sorted(candidates)
+                if source["topic"].session_id not in cluster_sessions[cluster_index]
+                and all(
+                    self._matches(existing, source)
+                    for existing in clusters[cluster_index]
+                )
+            ]
+            if compatible:
+                cluster_index = max(
+                    compatible,
+                    key=lambda candidate: (
+                        self._cluster_match_strength(clusters[candidate], source),
+                        -candidate,
+                    ),
+                )
+                clusters[cluster_index].append(source)
+                cluster_sessions[cluster_index].add(source["topic"].session_id)
+            else:
+                cluster_index = len(clusters)
+                clusters.append([source])
+                cluster_sessions.append({source["topic"].session_id})
             for token in source["title_tokens"]:
-                inverted[token].append(index)
-
-        groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for index, source in enumerate(sources):
-            groups[find(index)].append(source)
+                inverted[token].add(cluster_index)
         result = [
             sorted(group, key=self._source_sort_key)
-            for group in groups.values()
+            for group in clusters
             if len(group) > 1
         ]
         result.sort(key=lambda group: self._source_sort_key(group[0]))
         return result
+
+    @staticmethod
+    def _cluster_match_strength(
+        cluster: list[dict[str, Any]], source: dict[str, Any]
+    ) -> float:
+        return min(
+            jaccard(existing["card_tokens"], source["card_tokens"])
+            for existing in cluster
+        )
 
     def _matches(self, left: dict[str, Any], right: dict[str, Any]) -> bool:
         left_title = left["title_tokens"]
@@ -290,7 +440,12 @@ class GlobalTopicStore:
         )
 
     def _previous_groups(self) -> list[dict[str, Any]]:
-        return list(self._read_index().get("topics", []))
+        if not self.index_path.exists():
+            return []
+        value = read_json(self.index_path)
+        if not isinstance(value, dict) or not isinstance(value.get("topics"), list):
+            raise ValueError(f"invalid global topic index: {self.index_path}")
+        return list(value["topics"])
 
     def _build_projection_records(
         self,
@@ -303,17 +458,20 @@ class GlobalTopicStore:
             topic_ids = [source["topic"].id for source in cluster]
             global_id = self._reuse_id(topic_ids, previous, used_previous)
             if not global_id:
-                global_id = self._new_id(cluster[0])
+                global_id = self._new_id(min(cluster, key=self._identity_anchor_key))
             used_previous.add(global_id)
-            current = cluster[-1]
+            current = max(cluster, key=self._source_sort_key)
             records.append(
                 {
                     "id": global_id,
                     "title": current["topic"].title,
                     "current_topic_id": current["topic"].id,
                     "source_count": len(cluster),
-                    "first_seen_at": cluster[0]["session_started_at"],
-                    "last_seen_at": current["session_started_at"],
+                    "first_seen_at": min(
+                        source["session_started_at"] for source in cluster
+                    ),
+                    "last_seen_at": current["topic"].updated_at,
+                    "current_updated_at": current["topic"].updated_at,
                     "topic_ids": topic_ids,
                     "_sources": cluster,
                 }
@@ -365,7 +523,7 @@ class GlobalTopicStore:
             atomic_write_json(
                 stage / "index.json",
                 {
-                    "version": 1,
+                    "version": INDEX_VERSION,
                     "generated_at": utc_or_local_now(),
                     "topics": public_records,
                 },
@@ -400,11 +558,11 @@ class GlobalTopicStore:
 
     @staticmethod
     def _render_current(record: dict[str, Any]) -> str:
-        source = record["_sources"][-1]
+        source = max(record["_sources"], key=GlobalTopicStore._source_sort_key)
         topic: Topic = source["topic"]
         metadata = {
             "id": record["id"],
-            "projection": "current",
+            "projection": "latest-session-snapshot",
             "title": topic.title,
             "source_topic_id": topic.id,
             "source_session_id": topic.session_id,
@@ -413,7 +571,10 @@ class GlobalTopicStore:
         frontmatter = _yaml(metadata)
         return (
             f"---\n{frontmatter}\n---\n"
-            f"# Текущее состояние\n\n{topic.summary.strip()}\n"
+            "# Последний сессионный snapshot\n\n"
+            "> Это последняя обновлённая сессионная версия, а не синтез всех "
+            "исторических summaries.\n\n"
+            f"{topic.summary.strip()}\n"
         )
 
     @staticmethod
@@ -421,10 +582,12 @@ class GlobalTopicStore:
         lines = [f"# История: {record['title']}", ""]
         for source in record["_sources"]:
             topic: Topic = source["topic"]
-            date = str(source["session_started_at"])[:10] or "unknown"
+            session_date = str(source["session_started_at"]) or "unknown"
+            updated_date = topic.updated_at or "unknown"
             description = topic.description.strip() or topic.problem.strip()
             lines.append(
-                f"- **{date}** — {topic.title} (`{topic.id}`)"
+                f"- **updated {updated_date}** — {topic.title} (`{topic.id}`; "
+                f"session started {session_date})"
                 + (f": {description}" if description else "")
             )
         return "\n".join(lines).rstrip() + "\n"
@@ -440,6 +603,7 @@ class GlobalTopicStore:
                     "topic_id": source["topic"].id,
                     "session_id": source["topic"].session_id,
                     "session_started_at": source["session_started_at"],
+                    "topic_updated_at": source["topic"].updated_at,
                     "path": source["path"],
                 }
                 for source in record["_sources"]
@@ -448,10 +612,12 @@ class GlobalTopicStore:
 
     def _read_index(self) -> dict[str, Any]:
         if not self.index_path.exists():
-            return {"version": 1, "topics": []}
+            return {"version": INDEX_VERSION, "topics": []}
         value = read_json(self.index_path)
         if not isinstance(value, dict) or not isinstance(value.get("topics"), list):
             raise ValueError(f"invalid global topic index: {self.index_path}")
+        if value.get("version") != INDEX_VERSION:
+            return {"version": INDEX_VERSION, "topics": []}
         return value
 
     def _portable_path(self, path: Path) -> str:
@@ -463,7 +629,12 @@ class GlobalTopicStore:
     @staticmethod
     def _source_sort_key(source: dict[str, Any]) -> tuple[str, str, str]:
         topic: Topic = source["topic"]
-        return str(source["session_started_at"]), topic.updated_at, topic.id
+        return topic.updated_at, str(source["session_started_at"]), topic.id
+
+    @staticmethod
+    def _identity_anchor_key(source: dict[str, Any]) -> tuple[str, str, str]:
+        topic: Topic = source["topic"]
+        return str(source["session_started_at"]), topic.created_at, topic.id
 
 
 def _yaml(value: dict[str, Any]) -> str:

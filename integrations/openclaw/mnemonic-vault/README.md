@@ -2,7 +2,7 @@
 
 Native OpenClaw memory-slot plugin. It records user/assistant turns through
 lifecycle hooks, injects bounded topic summaries before a turn, exposes
-source-expansion and global-timeline tools, and bundles the `mnemonic-vault-memory`
+source-expansion and token-bounded latest-snapshot/timeline tools, and bundles the `mnemonic-vault-memory`
 skill. Captured
 events are `fsync`ed to a persistent spool before delivery and replayed with
 stable event IDs after OpenClaw or Vault restarts.

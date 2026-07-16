@@ -72,10 +72,13 @@ export class VaultClient {
     async openTopic(topicId) {
         return this.request(`/v1/memory/topics/${encodeURIComponent(topicId)}`);
     }
-    async openGlobalTopic(globalTopicId, maxTimelineEntries = 50) {
+    async openGlobalTopic(globalTopicId, maxTimelineEntries = 50, totalTokenBudget) {
         const query = new URLSearchParams({
             max_timeline_entries: String(maxTimelineEntries),
         });
+        if (totalTokenBudget !== undefined) {
+            query.set("total_token_budget", String(totalTokenBudget));
+        }
         return this.request(`/v1/memory/global-topics/${encodeURIComponent(globalTopicId)}?${query.toString()}`);
     }
     async expandTopic(topicId, query, maxFragments = 5, tokenBudget) {

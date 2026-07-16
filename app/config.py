@@ -47,6 +47,7 @@ class GlobalTopicsConfig:
     minimum_versions: int = 12
     title_similarity_threshold: float = 0.5
     lexical_similarity_threshold: float = 0.72
+    total_token_budget: int = 3_000
 
 
 @dataclass(slots=True)
