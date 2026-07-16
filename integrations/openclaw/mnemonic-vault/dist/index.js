@@ -11,6 +11,7 @@ const DEFAULTS = {
     baseUrl: "http://127.0.0.1:8765",
     agent: "openclaw",
     agentInstanceId: "openclaw-main",
+    projectId: "",
     autoCapture: true,
     autoRecall: true,
     maxTopics: 5,
@@ -28,6 +29,7 @@ const configSchema = buildJsonPluginConfigSchema({
         baseUrl: { type: "string" },
         agent: { type: "string" },
         agentInstanceId: { type: "string", minLength: 1 },
+        projectId: { type: "string" },
         autoCapture: { type: "boolean" },
         autoRecall: { type: "boolean" },
         maxTopics: { type: "integer", minimum: 1, maximum: 50 },
@@ -47,6 +49,7 @@ function resolveConfig(value) {
         agentInstanceId: typeof raw.agentInstanceId === "string" && raw.agentInstanceId.trim()
             ? raw.agentInstanceId.trim()
             : DEFAULTS.agentInstanceId,
+        projectId: typeof raw.projectId === "string" ? raw.projectId.trim() : "",
         autoCapture: raw.autoCapture ?? DEFAULTS.autoCapture,
         autoRecall: raw.autoRecall ?? DEFAULTS.autoRecall,
         maxTopics: finiteInt(raw.maxTopics, DEFAULTS.maxTopics),
@@ -205,7 +208,7 @@ export default definePluginEntry({
         api.registerTool({
             name: "memory_search",
             label: "Search memory",
-            description: "Search Mnemonic Vault topics using hybrid lexical and vector retrieval.",
+            description: "Search the shared Mnemonic Vault. Scopes boost ranking by default; use strict only when the user explicitly requests one scope.",
             parameters: Type.Object({
                 query: Type.String(),
                 max_topics: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
@@ -221,6 +224,17 @@ export default definePluginEntry({
                     ]),
                     id: Type.Optional(Type.String()),
                 })),
+                context_scopes: Type.Optional(Type.Array(Type.Object({
+                    type: Type.Union([
+                        Type.Literal("global"),
+                        Type.Literal("agent"),
+                        Type.Literal("project"),
+                        Type.Literal("session"),
+                    ]),
+                    id: Type.Optional(Type.String()),
+                }), { maxItems: 6 })),
+                scope_mode: Type.Optional(Type.Union([Type.Literal("boost"), Type.Literal("strict")])),
+                include_all_scopes: Type.Optional(Type.Boolean()),
             }),
             async execute(_id, rawParams) {
                 const params = rawParams;
@@ -231,6 +245,15 @@ export default definePluginEntry({
                         totalContextBudgetTokens: params.total_context_budget_tokens,
                         includeSources: params.include_sources,
                         scope: params.scope,
+                        contextScopes: [
+                            { type: "agent", id: config.agentInstanceId },
+                            ...(config.projectId
+                                ? [{ type: "project", id: config.projectId }]
+                                : []),
+                            ...(params.context_scopes ?? []),
+                        ],
+                        scopeMode: params.scope_mode,
+                        includeAllScopes: params.include_all_scopes,
                     }));
                 }
                 catch (error) {
@@ -255,7 +278,7 @@ export default definePluginEntry({
                     Type.Literal("task"),
                     Type.Literal("correction"),
                 ])),
-                scope: Type.Object({
+                scope: Type.Optional(Type.Object({
                     type: Type.Union([
                         Type.Literal("global"),
                         Type.Literal("agent"),
@@ -263,7 +286,7 @@ export default definePluginEntry({
                         Type.Literal("session"),
                     ]),
                     id: Type.Optional(Type.String()),
-                }),
+                })),
                 source_session_id: Type.Optional(Type.String()),
                 source_message_id: Type.Optional(Type.Integer({ minimum: 1 })),
                 idempotency_key: Type.Optional(Type.String()),
@@ -275,7 +298,7 @@ export default definePluginEntry({
                     return toolResult(await client.remember(params.verbatim, {
                         normalized: params.normalized,
                         kind: params.kind,
-                        scope: params.scope,
+                        scope: params.scope ?? { type: "global" },
                         sourceSessionId: params.source_session_id,
                         sourceMessageId: params.source_message_id,
                         idempotencyKey: params.idempotency_key,
@@ -318,7 +341,7 @@ export default definePluginEntry({
                     scope = { type: "agent", id: selector.slice("agent:".length) };
                 }
                 else {
-                    scope = { type: "agent", id: config.agentInstanceId };
+                    scope = { type: "global" };
                 }
                 const digest = createHash("sha256")
                     .update(`${config.agentInstanceId}\0${externalId}\0${ctx.commandBody}`)
@@ -474,6 +497,14 @@ export default definePluginEntry({
                     maxTopics: config.maxTopics,
                     summaryBudgetTokens: config.summaryBudgetTokens,
                     includeSources: config.includeSources,
+                    contextScopes: [
+                        { type: "agent", id: config.agentInstanceId },
+                        ...(config.projectId
+                            ? [{ type: "project", id: config.projectId }]
+                            : []),
+                        { type: "session", id: vaultSession(externalId) },
+                    ],
+                    scopeMode: "boost",
                 });
                 const context = formatMemoryContext(result);
                 return context ? { prependContext: context } : undefined;

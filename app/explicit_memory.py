@@ -32,6 +32,14 @@ MEMORY_KINDS = {
     "correction",
 }
 SCOPE_TYPES = {"global", "agent", "project", "session"}
+SCOPE_MODES = {"boost", "strict"}
+SCOPE_BOOSTS = {
+    "project": 0.12,
+    "session": 0.10,
+    "agent": 0.08,
+}
+GLOBAL_SCOPE_BOOST = 0.05
+FOREIGN_SESSION_PENALTY = 0.18
 
 
 class ExplicitMemoryStore:
@@ -185,7 +193,30 @@ class ExplicitMemoryStore:
         include_superseded: bool = False,
         scope_type: str | None = None,
         scope_id: str | None = None,
+        context_scopes: list[tuple[str, str | None]] | None = None,
+        scope_mode: str = "boost",
+        include_all_scopes: bool = False,
     ) -> list[dict[str, Any]]:
+        if scope_mode not in SCOPE_MODES:
+            raise ValueError("scope_mode must be boost or strict")
+        scopes = set(context_scopes or [])
+        strict_scopes: set[tuple[str, str | None]] = set()
+        if scope_type:
+            primary_scope = (scope_type, scope_id)
+            scopes.add(primary_scope)
+            strict_scopes.add(primary_scope)
+        else:
+            strict_scopes.update(scopes)
+        for context_type, context_id in scopes:
+            if context_type not in SCOPE_TYPES:
+                raise ValueError(f"unknown context scope type: {context_type}")
+            if context_type == "global" and context_id:
+                raise ValueError("global context scope must not have an id")
+            if context_type != "global" and not context_id:
+                raise ValueError(f"{context_type} context scope requires an id")
+        if scope_mode == "strict" and not strict_scopes:
+            raise ValueError("strict scope search requires scope or context_scopes")
+
         expression = fts_query(query)
         lexical_rows = (
             self.catalog.lexical_search_explicit(
@@ -229,6 +260,9 @@ class ExplicitMemoryStore:
             memory = self._memory_from_row(row)
             if memory is None or (memory.status != "active" and not include_superseded):
                 continue
+            memory_scope = (memory.scope_type, memory.scope_id)
+            if scope_mode == "strict" and memory_scope not in strict_scopes:
+                continue
             base = max(lexical_scores.get(memory_id, 0.0), vector_scores.get(memory_id, 0.0))
             if base <= 0.0:
                 continue
@@ -239,12 +273,19 @@ class ExplicitMemoryStore:
                 boost += 0.08
             if memory.author == "user":
                 boost += 0.05
-            if scope_type and memory.scope_type == scope_type and memory.scope_id == scope_id:
-                boost += 0.12
-            elif memory.scope_type == "global":
-                boost += 0.03
+            if memory.scope_type == "global":
+                boost += GLOBAL_SCOPE_BOOST
+            elif memory_scope in scopes:
+                boost += SCOPE_BOOSTS[memory.scope_type]
+            elif memory.scope_type == "session" and not include_all_scopes:
+                # Session facts remain discoverable across the shared Vault, but
+                # automatic recall should not casually inject another chat's
+                # temporary instructions into the current prompt.
+                boost -= FOREIGN_SESSION_PENALTY
             # A deterministic recency tie-breaker comes from the final tuple sort.
-            ranked.append((min(1.0, base + boost), memory))
+            score = max(0.0, min(1.0, base + boost))
+            if score > 0.0:
+                ranked.append((score, memory))
         ranked.sort(key=lambda item: (item[0], item[1].created_at, item[1].memory_id), reverse=True)
         return [memory.to_search_dict(score) for score, memory in ranked[:limit]]
 

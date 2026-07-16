@@ -100,6 +100,9 @@ class SearchRequest(BaseModel):
     total_context_budget_tokens: int | None = Field(default=None, ge=100, le=32000)
     include_sources: Literal["auto", "always", "never"] = "auto"
     scope: MemoryScopeRequest | None = None
+    context_scopes: list[MemoryScopeRequest] = Field(default_factory=list, max_length=8)
+    scope_mode: Literal["boost", "strict"] = "boost"
+    include_all_scopes: bool = False
 
 
 class RememberRequest(BaseModel):
@@ -161,7 +164,7 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.5.0",
+        version="0.5.1",
         lifespan=lifespan,
     )
     app.state.services = services
@@ -255,13 +258,16 @@ def create_app(
         if len(payload.query) > services.config.api.max_query_chars:
             raise HTTPException(status_code=413, detail="query is too large")
         return services.context_builder.build(
-            payload.query,
-            payload.max_topics,
-            payload.summary_budget_tokens,
-            payload.include_sources,
-            payload.total_context_budget_tokens,
-            payload.scope.type if payload.scope else None,
-            payload.scope.id if payload.scope else None,
+            query=payload.query,
+            max_topics=payload.max_topics,
+            summary_budget_tokens=payload.summary_budget_tokens,
+            include_sources=payload.include_sources,
+            total_context_budget_tokens=payload.total_context_budget_tokens,
+            scope_type=payload.scope.type if payload.scope else None,
+            scope_id=payload.scope.id if payload.scope else None,
+            context_scopes=[(scope.type, scope.id) for scope in payload.context_scopes],
+            scope_mode=payload.scope_mode,
+            include_all_scopes=payload.include_all_scopes,
         )
 
     @app.post("/v1/memory/remember", status_code=201)

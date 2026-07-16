@@ -67,6 +67,11 @@ export class VaultClient {
                     : { total_context_budget_tokens: options.totalContextBudgetTokens }),
                 include_sources: options.includeSources ?? "auto",
                 ...(options.scope === undefined ? {} : { scope: options.scope }),
+                ...(options.contextScopes === undefined
+                    ? {}
+                    : { context_scopes: options.contextScopes }),
+                scope_mode: options.scopeMode ?? "boost",
+                include_all_scopes: options.includeAllScopes ?? false,
             }),
         });
     }

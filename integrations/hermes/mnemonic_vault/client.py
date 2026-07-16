@@ -76,6 +76,9 @@ class VaultClient:
         total_context_budget_tokens: int | None = None,
         include_sources: str = "auto",
         scope: dict[str, str] | None = None,
+        context_scopes: list[dict[str, str]] | None = None,
+        scope_mode: str = "boost",
+        include_all_scopes: bool = False,
     ) -> dict[str, Any]:
         return self._request(
             "/v1/memory/search",
@@ -86,6 +89,13 @@ class VaultClient:
                 "summary_budget_tokens": summary_budget_tokens,
                 "include_sources": include_sources,
                 **({"scope": scope} if scope is not None else {}),
+                **(
+                    {"context_scopes": context_scopes}
+                    if context_scopes is not None
+                    else {}
+                ),
+                "scope_mode": scope_mode,
+                "include_all_scopes": include_all_scopes,
                 **(
                     {"total_context_budget_tokens": total_context_budget_tokens}
                     if total_context_budget_tokens is not None

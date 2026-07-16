@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 export type IncludeSources = "auto" | "always" | "never";
+export type ScopeMode = "boost" | "strict";
 export type MemoryKind =
   | "fact"
   | "preference"
@@ -92,6 +93,9 @@ export class VaultClient {
       totalContextBudgetTokens?: number;
       includeSources?: IncludeSources;
       scope?: MemoryScope;
+      contextScopes?: MemoryScope[];
+      scopeMode?: ScopeMode;
+      includeAllScopes?: boolean;
     } = {},
   ): Promise<Record<string, unknown>> {
     return this.request("/v1/memory/search", {
@@ -105,6 +109,11 @@ export class VaultClient {
           : { total_context_budget_tokens: options.totalContextBudgetTokens }),
         include_sources: options.includeSources ?? "auto",
         ...(options.scope === undefined ? {} : { scope: options.scope }),
+        ...(options.contextScopes === undefined
+          ? {}
+          : { context_scopes: options.contextScopes }),
+        scope_mode: options.scopeMode ?? "boost",
+        include_all_scopes: options.includeAllScopes ?? false,
       }),
     });
   }

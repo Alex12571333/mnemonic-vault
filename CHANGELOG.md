@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 — 2026-07-16
+
+- Keep every agent, project, and session scope in one shared retrieval space;
+  scopes are contextual ranking signals rather than access-control boundaries.
+- Add default `scope_mode=boost`, optional explicit `scope_mode=strict`, multiple
+  `context_scopes`, and `include_all_scopes` for unpenalized historical recall.
+- Boost current project, session, agent, and global memories while strongly
+  downranking—but never hiding—other sessions during automatic recall.
+- Make unqualified `/remember` and tool calls global by default, and let OpenClaw
+  and Hermes attach their stable agent, current session, and optional project IDs.
+
 ## 0.5.0 — 2026-07-16
 
 - Add append-only `data/explicit-memory.jsonl` for direct user-authored memories,

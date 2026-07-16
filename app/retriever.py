@@ -187,6 +187,9 @@ class Retriever:
         max_memories: int | None = None,
         scope_type: str | None = None,
         scope_id: str | None = None,
+        context_scopes: list[tuple[str, str | None]] | None = None,
+        scope_mode: str = "boost",
+        include_all_scopes: bool = False,
     ) -> list[dict[str, Any]]:
         if self.explicit_memory is None or not query.strip():
             return []
@@ -196,6 +199,9 @@ class Retriever:
             include_superseded=bool(HISTORICAL_QUERY.search(query)),
             scope_type=scope_type,
             scope_id=scope_id,
+            context_scopes=context_scopes,
+            scope_mode=scope_mode,
+            include_all_scopes=include_all_scopes,
         )
 
     def search(
@@ -482,6 +488,9 @@ class ContextBuilder:
         total_context_budget_tokens: int | None = None,
         scope_type: str | None = None,
         scope_id: str | None = None,
+        context_scopes: list[tuple[str, str | None]] | None = None,
+        scope_mode: str = "boost",
+        include_all_scopes: bool = False,
     ) -> dict[str, Any]:
         if include_sources not in {"auto", "always", "never"}:
             raise ValueError("include_sources must be auto, always, or never")
@@ -501,12 +510,32 @@ class ContextBuilder:
             self.config.retrieval.explicit_memory_top_k,
             scope_type,
             scope_id,
+            context_scopes,
+            scope_mode,
+            include_all_scopes,
         )
         # Any lexical explicit-memory hit must stay recallable without waiting on
         # an offline embedding endpoint. Topic FTS still runs in the same request.
         hits = self.retriever.search(
             query, max_topics=max_topics, use_vector=not bool(explicit_hits)
         )
+        if scope_mode == "strict":
+            strict_scopes = (
+                {(scope_type, scope_id)}
+                if scope_type
+                else set(context_scopes or [])
+            )
+            strict_session_ids = {
+                value
+                for kind, value in strict_scopes
+                if kind == "session" and value
+            }
+            # Session topics have a real session identity and can participate in
+            # strict session search. Project/agent/global are explicit-memory
+            # labels, so unscoped topic cards must not leak into strict results.
+            hits = [
+                hit for hit in hits if hit.topic.session_id in strict_session_ids
+            ]
         used = 0
         explicit_used = 0
         card_used = 0
@@ -604,6 +633,7 @@ class ContextBuilder:
                 "explicit_memories": explicit_used,
             },
             "can_expand": bool(output or explicit_output),
+            "scope_mode": scope_mode,
         }
 
 

@@ -76,6 +76,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             os.getenv("MNEMONIC_VAULT_AGENT_INSTANCE_ID", "hermes-main").strip()
             or "hermes-main"
         )
+        self._project_id = os.getenv("MNEMONIC_VAULT_PROJECT_ID", "").strip()
         self._session_id = ""
         self._vault_sessions: dict[str, str] = {}
         self._write_enabled = True
@@ -143,7 +144,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         if cached is not None:
             return cached
         if future is None:
-            future = self._prefetch_pool.submit(self._recall, query)
+            future = self._prefetch_pool.submit(self._recall, query, session_id)
         try:
             return future.result(timeout=self._prefetch_timeout)
         except TimeoutError:
@@ -161,7 +162,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         with self._lock:
             if key in self._prefetch_cache or key in self._prefetch_futures:
                 return
-            future = self._prefetch_pool.submit(self._recall, query)
+            future = self._prefetch_pool.submit(self._recall, query, session_id)
             self._prefetch_futures[key] = future
 
         def store(completed: Future[str]) -> None:
@@ -327,7 +328,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         return [
             _tool(
                 "memory_search",
-                "Search durable topics using hybrid lexical and vector retrieval.",
+                "Search the shared Vault. Scopes boost by default; use strict only for an explicitly requested scope.",
                 {
                     "type": "object",
                     "properties": {
@@ -359,6 +360,27 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                             "required": ["type"],
                             "additionalProperties": False,
                         },
+                        "context_scopes": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "enum": ["global", "agent", "project", "session"],
+                                    },
+                                    "id": {"type": "string"},
+                                },
+                                "required": ["type"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "scope_mode": {
+                            "type": "string",
+                            "enum": ["boost", "strict"],
+                        },
+                        "include_all_scopes": {"type": "boolean"},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -402,7 +424,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                         "idempotency_key": {"type": "string"},
                         "supersedes": {"type": "string"},
                     },
-                    "required": ["verbatim", "scope"],
+                    "required": ["verbatim"],
                     "additionalProperties": False,
                 },
             ),
@@ -474,13 +496,18 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                         "total_context_budget_tokens"
                     ),
                     scope=args.get("scope"),
+                    context_scopes=self._search_context_scopes(
+                        args.get("context_scopes")
+                    ),
+                    scope_mode=args.get("scope_mode", "boost"),
+                    include_all_scopes=args.get("include_all_scopes", False),
                 )
             elif tool_name == "memory_remember":
                 value = self._client.remember(
                     args["verbatim"],
                     normalized=args.get("normalized"),
                     kind=args.get("kind", "fact"),
-                    scope=args["scope"],
+                    scope=args.get("scope", {"type": "global"}),
                     source_session_id=args.get("source_session_id"),
                     source_message_id=args.get("source_message_id"),
                     idempotency_key=args.get("idempotency_key"),
@@ -533,15 +560,46 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             }
         ]
 
-    def _recall(self, query: str) -> str:
+    def _recall(self, query: str, session_id: str = "") -> str:
         return format_memory_context(
             self._client.search(
                 query,
                 max_topics=self._max_topics,
                 summary_budget_tokens=self._summary_budget,
                 include_sources="auto",
+                context_scopes=self._search_context_scopes(
+                    session_id=session_id
+                ),
+                scope_mode="boost",
             )
         )
+
+    def _search_context_scopes(
+        self,
+        extra: list[dict[str, str]] | None = None,
+        *,
+        session_id: str = "",
+    ) -> list[dict[str, str]]:
+        scopes: list[dict[str, str]] = [
+            {"type": "agent", "id": self._agent_instance_id}
+        ]
+        if self._project_id:
+            scopes.append({"type": "project", "id": self._project_id})
+        external_id = session_id or self._session_id
+        if external_id:
+            scopes.append(
+                {"type": "session", "id": self._vault_session(external_id)}
+            )
+        scopes.extend(extra or [])
+        unique: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for scope in scopes:
+            key = (str(scope.get("type", "")), str(scope.get("id", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(scope)
+        return unique[:8]
 
     def _start_worker(self) -> None:
         if self._worker and self._worker.is_alive():
