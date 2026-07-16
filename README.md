@@ -13,6 +13,8 @@ append-only файлами, тематические summary хранятся в
 ## Инварианты
 
 - `transcript.jsonl` — источник истины и никогда не заменяется summary.
+- `explicit-memory.jsonl` — append-only журнал только прямых пользовательских
+  команд «запомни»; SQLite хранит его восстанавливаемое текущее представление.
 - Topic Markdown обновляется атомарно через временный файл, `fsync` и `rename`.
 - Сообщение сначала дописывается и синхронизируется на диск, затем меняются метаданные.
 - `catalog.sqlite` можно удалить и пересоздать командой `rebuild-index`.
@@ -61,7 +63,9 @@ POST /v1/sessions/start
 POST /v1/sessions/{session_id}/messages
 POST /v1/sessions/{session_id}/end
 POST /v1/memory/search
+POST /v1/memory/remember
 POST /v1/memory/search-transcript
+GET  /v1/memory/explicit/{memory_id}
 GET  /v1/memory/topics/{topic_id}
 POST /v1/memory/topics/{topic_id}/expand
 GET  /v1/memory/global-topics
@@ -96,6 +100,64 @@ curl -sS http://127.0.0.1:8765/v1/memory/search \
 создают детерминированные `event-*` из постоянного ID установки, внешнего ID чата,
 роли и ID/номера хода; такие события идемпотентны глобально, в том числе после
 рестарта агента или перенаправления в recovery-сессию.
+
+## Пятый триггер: явное «запомни»
+
+Четыре фоновых триггера summary остаются прежними: число сообщений, число токенов,
+idle timeout и `session_end`. Пятый триггер не ждёт Memory LLM:
+
+```text
+точное сообщение пользователя
+→ fsync transcript.jsonl
+→ fsync data/explicit-memory.jsonl
+→ SQLite FTS
+→ факт уже доступен retrieval
+→ priority summary-job
+→ позднее включение в session topic
+```
+
+Если embedding или Qwen/vLLM недоступны, успешная явная запись всё равно сразу
+находится лексически. Embedding достраивается командой `reembed-all`, а summary-job
+остаётся в очереди до восстановления Memory LLM.
+
+```bash
+curl -sS http://127.0.0.1:8765/v1/memory/remember \
+  -H 'content-type: application/json' \
+  -d '{
+    "verbatim":"Запомни: production Mnemonic Vault работает на 192.168.0.14",
+    "normalized":"Production Mnemonic Vault работает на 192.168.0.14",
+    "kind":"configuration",
+    "scope":{"type":"project","id":"mnemonic-vault"},
+    "idempotency_key":"event-production-server-14"
+  }'
+```
+
+Допустимые `kind`: `fact`, `preference`, `decision`, `configuration`, `identity`,
+`constraint`, `task`, `correction`. Scope бывает `global`, `agent`, `project` и
+`session`; у всех, кроме `global`, обязателен `id`. В v0.5.0 явные записи всегда
+`author=user`: агент не может самовольно создавать глобальные воспоминания.
+
+`verbatim` хранит точные слова пользователя, а `normalized` — отдельную поисковую
+формулировку. Повтор с тем же `idempotency_key` возвращает прежний `memory_id`.
+Новый факт с `supersedes` не переписывает старый: прежняя запись получает
+производный статус `superseded` и остаётся доступной для исторических запросов.
+`/v1/memory/search` сохраняет совместимые поля `topics` и `explicit_memories`, а
+также возвращает общий ранжированный список `results` с типами `topic` и
+`explicit_memory`.
+
+Гарантированные пути без решения LLM:
+
+```bash
+python run.py remember "Production работает на 192.168.0.14" \
+  --kind configuration --scope-type project --scope-id mnemonic-vault
+```
+
+OpenClaw также поддерживает `/remember`. Без selector команда использует scope
+`agent:openclaw-main`; selector можно задать явно:
+
+```text
+/remember project:mnemonic-vault Production работает на 192.168.0.14
+```
 
 ## Надёжная доставка
 
@@ -154,6 +216,7 @@ data/global-topics/<global-topic-id>/
 ```bash
 python run.py rebuild-global-topics --dry-run
 python run.py rebuild-global-topics
+python run.py remember "точный факт" --kind fact --scope-type global
 ```
 
 После обновления с 0.4.0 существующие производные проекции нужно один раз
@@ -195,10 +258,12 @@ python run.py rebuild-global-topics
 
 ## Нативные интеграции агентов
 
-Версия 0.4.1 включает два lossless-адаптера:
+Версия 0.5.0 включает два lossless-адаптера:
 
-- OpenClaw memory-slot plugin с lifecycle hooks, семью memory tools и встроенным skill;
-- Hermes Agent `MemoryProvider` с persistent spool, bounded prefetch и теми же tools.
+- OpenClaw memory-slot plugin с lifecycle hooks, восемью memory tools,
+  гарантированной `/remember` command и встроенным skill;
+- Hermes Agent `MemoryProvider` с persistent spool, bounded prefetch и теми же
+  восемью tools, включая `memory_remember`.
 
 Оба адаптера автоматически сохраняют ходы, подмешивают только небольшой релевантный
 контекст и позволяют раскрывать исходные transcript ranges для точных значений.

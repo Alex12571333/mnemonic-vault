@@ -7,6 +7,7 @@ from .catalog import Catalog
 from .config import AppConfig
 from .embeddings import Embedder, pack_vector, topic_embedding_text
 from .models import Topic, utc_or_local_now
+from .recorder import SessionRecorder
 from .storage import read_messages, read_session, read_topic
 
 
@@ -98,11 +99,20 @@ class Indexer:
                 except Exception:
                     logger.exception("could not index topic at %s", topic_file)
                     failures += 1
+        from .explicit_memory import ExplicitMemoryStore
+
+        explicit = ExplicitMemoryStore(
+            self.config,
+            self.catalog,
+            SessionRecorder(self.config, self.catalog),
+            self.embedder,
+        ).rebuild_index(with_embeddings=with_embeddings)
         return {
             "sessions": sessions,
             "topics": topics,
             "messages": messages,
             "recovered_jobs": recovered_jobs,
+            **explicit,
             "failures": failures,
         }
 
@@ -122,4 +132,17 @@ class Indexer:
             except Exception:
                 logger.exception("could not re-embed topic %s", row["id"])
                 failed += 1
-        return {"embedded": succeeded, "failures": failed}
+        from .explicit_memory import ExplicitMemoryStore
+
+        explicit = ExplicitMemoryStore(
+            self.config,
+            self.catalog,
+            SessionRecorder(self.config, self.catalog),
+            self.embedder,
+        ).reembed_all()
+        return {
+            "embedded": succeeded + explicit["embedded"],
+            "topic_embeddings": succeeded,
+            "explicit_memory_embeddings": explicit["embedded"],
+            "failures": failed + explicit["failures"],
+        }

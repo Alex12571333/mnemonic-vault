@@ -7,6 +7,18 @@ description: Recall and inspect durable Mnemonic Vault history. Use when a reque
 
 Mnemonic Vault automatically supplies a small relevant context before ordinary turns. Use the tools below when the answer needs deliberate recall or source-level precision.
 
+## Explicit remember workflow
+
+When the user directly says “remember”, “save this”, “do not forget”, “keep this for
+the future”, or the equivalent in another language, call `memory_remember` before
+claiming that the fact was stored. Copy the user's exact words into `verbatim`; put any
+search-friendly rendering in `normalized`. Choose the narrowest correct scope.
+
+Do not call `memory_remember` merely because a detail seems useful. In this version,
+only a direct user request authorizes explicit memory. Never infer or create a global
+memory autonomously. Use `supersedes` for a direct correction instead of overwriting
+the old fact. A successful receipt must say `available_for_recall: true`.
+
 ## Recall workflow
 
 1. Call `memory_search` with the user's current question, not the whole conversation.
@@ -30,6 +42,7 @@ Set `include_sources` to `always` for exact-value requests and to `auto` otherwi
 ## Tool map
 
 - `memory_search`: hybrid BM25/vector recall with bounded summaries.
+- `memory_remember`: immediately store a direct user-authored fact and queue its later topic integration.
 - `memory_get` / `memory_open_topic`: read one topic and its summary.
 - `memory_open_global_topic`: read a token-bounded latest-session snapshot, timeline, and source topic IDs.
 - `memory_expand_topic`: retrieve precise fragments only inside a topic's source ranges.

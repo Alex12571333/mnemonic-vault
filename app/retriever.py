@@ -169,17 +169,42 @@ class Retriever:
         catalog: Catalog,
         recorder: SessionRecorder,
         embedder: Embedder | None = None,
+        explicit_memory: Any | None = None,
     ):
         self.config = config
         self.catalog = catalog
         self.recorder = recorder
         self.embedder = embedder
+        self.explicit_memory = explicit_memory
         self.session_aliases = SessionAliasStore(
             config.storage.root / "session-aliases.json"
         )
         self.global_topics = GlobalTopicStore(config)
 
-    def search(self, query: str, max_topics: int | None = None) -> list[SearchHit]:
+    def search_explicit(
+        self,
+        query: str,
+        max_memories: int | None = None,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.explicit_memory is None or not query.strip():
+            return []
+        return self.explicit_memory.search(
+            query,
+            limit=max_memories or self.config.retrieval.explicit_memory_top_k,
+            include_superseded=bool(HISTORICAL_QUERY.search(query)),
+            scope_type=scope_type,
+            scope_id=scope_id,
+        )
+
+    def search(
+        self,
+        query: str,
+        max_topics: int | None = None,
+        *,
+        use_vector: bool = True,
+    ) -> list[SearchHit]:
         if not query.strip():
             return []
         retrieval = self.config.retrieval
@@ -212,8 +237,10 @@ class Retriever:
                 if query_tokens
                 else 0.0
             )
-        vector_scores = self._vector_search(
-            query, retrieval.vector_top_k, temporal_topic_ids
+        vector_scores = (
+            self._vector_search(query, retrieval.vector_top_k, temporal_topic_ids)
+            if use_vector
+            else {}
         )
 
         lexical_ids = [
@@ -453,6 +480,8 @@ class ContextBuilder:
         summary_budget_tokens: int | None = None,
         include_sources: str = "auto",
         total_context_budget_tokens: int | None = None,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
     ) -> dict[str, Any]:
         if include_sources not in {"auto", "always", "never"}:
             raise ValueError("include_sources must be auto, always, or never")
@@ -467,13 +496,39 @@ class ContextBuilder:
             config.summary_budget_tokens,
             total_budget,
         )
-        hits = self.retriever.search(query, max_topics=max_topics)
+        explicit_hits = self.retriever.search_explicit(
+            query,
+            self.config.retrieval.explicit_memory_top_k,
+            scope_type,
+            scope_id,
+        )
+        # Any lexical explicit-memory hit must stay recallable without waiting on
+        # an offline embedding endpoint. Topic FTS still runs in the same request.
+        hits = self.retriever.search(
+            query, max_topics=max_topics, use_vector=not bool(explicit_hits)
+        )
         used = 0
+        explicit_used = 0
         card_used = 0
         summary_used = 0
         source_used = 0
         summaries_opened = 0
         output: list[dict[str, Any]] = []
+        explicit_output: list[dict[str, Any]] = []
+        explicit_budget = min(config.explicit_memory_budget_tokens, total_budget)
+        for memory in explicit_hits:
+            item = dict(memory)
+            item_tokens = estimate_tokens(json.dumps(item, ensure_ascii=False))
+            if item_tokens > explicit_budget - explicit_used:
+                # Keep the normalized searchable fact; verbatim remains available
+                # through GET /v1/memory/explicit/{memory_id}.
+                item.pop("verbatim", None)
+                item_tokens = estimate_tokens(json.dumps(item, ensure_ascii=False))
+            if item_tokens > explicit_budget - explicit_used:
+                break
+            explicit_output.append(item)
+            explicit_used += item_tokens
+            used += item_tokens
         auto_precision = bool(PRECISION_QUERY.search(query)) or any(
             pattern in query.lower() for pattern in PRECISION_PATTERNS
         )
@@ -528,7 +583,17 @@ class ContextBuilder:
                         used += fragment_tokens
                         source_used += fragment_tokens
             output.append(item)
+        unified_results = [
+            *explicit_output,
+            *[{"type": "topic", **item} for item in output],
+        ]
+        unified_results.sort(
+            key=lambda item: (float(item.get("score", 0.0)), str(item.get("created_at", ""))),
+            reverse=True,
+        )
         return {
+            "results": unified_results,
+            "explicit_memories": explicit_output,
             "topics": output,
             "used_tokens": used,
             "budget_tokens": total_budget,
@@ -536,8 +601,9 @@ class ContextBuilder:
                 "cards": card_used,
                 "summaries": summary_used,
                 "sources": source_used,
+                "explicit_memories": explicit_used,
             },
-            "can_expand": bool(output),
+            "can_expand": bool(output or explicit_output),
         }
 
 

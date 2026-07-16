@@ -1,7 +1,7 @@
 # Native OpenClaw and Hermes integrations
 
-Mnemonic Vault 0.4.1 ships two native adapters. Both use the same loopback HTTP
-API, expose the same seven memory tools, automatically record completed turns, and
+Mnemonic Vault 0.5.0 ships two native adapters. Both use the same loopback HTTP
+API, expose the same eight memory tools, automatically record completed turns, and
 inject only a bounded amount of retrieved history. Retrieval stays
 non-generative; the Memory LLM continues to run only in the background
 summarizer.
@@ -21,6 +21,8 @@ network errors and server failures remain pending for retry.
 The integrations expose:
 
 - `memory_search(query)` — hybrid topic search with a summary budget;
+- `memory_remember(verbatim, normalized, kind, scope)` — immediately store a
+  direct user-requested memory without waiting for the Memory LLM;
 - `memory_get(topic_id)` and `memory_open_topic(topic_id)` — open one summary;
 - `memory_open_global_topic(global_topic_id, total_token_budget?)` — open a bounded latest-session snapshot and timeline;
 - `memory_expand_topic(topic_id, query)` — exact fragments from topic ranges;
@@ -31,6 +33,10 @@ Retrieved content is marked as historical reference data, not instructions.
 Exact commands, versions, numbers, dates, parameters, addresses, and errors
 should be verified against transcript fragments. Mutable facts should also be
 checked against current live state.
+
+`memory_remember` is only for an explicit user command. OpenClaw additionally
+registers `/remember`, which bypasses the LLM entirely; the server also exposes
+`POST /v1/memory/remember` and the local `python run.py remember` command.
 
 ## OpenClaw memory-slot plugin
 

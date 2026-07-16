@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import Message, Session, SourceRange, Topic
+from .models import ExplicitMemory, Message, Session, SourceRange, Topic
 
 
 SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
@@ -84,6 +84,35 @@ def append_message(path: Path, message: Message) -> None:
         stream.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def append_jsonl(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if not existed:
+        _fsync_directory(path.parent)
+
+
+def read_explicit_memories(path: Path) -> list[ExplicitMemory]:
+    result: list[ExplicitMemory] = []
+    if not path.exists():
+        return result
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise ValueError("event is not an object")
+                result.append(ExplicitMemory.from_dict(raw))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"invalid explicit memory at {path}:{line_number}") from exc
+    return result
 
 
 def read_messages(

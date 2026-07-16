@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from .models import Message, Session, Topic
+from .models import ExplicitMemory, Message, Session, Topic
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +88,33 @@ CREATE TABLE IF NOT EXISTS vector_index_meta (
     dimension INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS explicit_memories (
+    memory_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    event TEXT NOT NULL,
+    verbatim TEXT NOT NULL,
+    normalized TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT,
+    author TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    supersedes TEXT,
+    valid_to TEXT,
+    requires_confirmation INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS explicit_memory_embeddings (
+    memory_id TEXT PRIMARY KEY REFERENCES explicit_memories(memory_id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts USING fts5(
     topic_id UNINDEXED,
     title,
@@ -107,10 +134,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     tokenize='unicode61 remove_diacritics 2'
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS explicit_memories_fts USING fts5(
+    memory_id UNINDEXED,
+    verbatim,
+    normalized,
+    kind,
+    scope_type,
+    scope_id,
+    tokenize='unicode61 remove_diacritics 2'
+);
+
 CREATE INDEX IF NOT EXISTS topics_session_idx ON topics(session_id);
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS messages_external_event_idx
     ON messages(session_id, external_event_id);
+CREATE INDEX IF NOT EXISTS explicit_memories_status_idx
+    ON explicit_memories(status, created_at);
+CREATE INDEX IF NOT EXISTS explicit_memories_scope_idx
+    ON explicit_memories(scope_type, scope_id, status);
 """
 
 
@@ -389,6 +430,146 @@ class Catalog:
                 parameters,
             ).fetchall()
 
+    def upsert_explicit_memory(self, memory: ExplicitMemory) -> None:
+        """Materialize one append-only explicit-memory event and its FTS row."""
+        with self.transaction(immediate=True) as connection:
+            if memory.supersedes:
+                existing = connection.execute(
+                    "SELECT status FROM explicit_memories WHERE memory_id = ?",
+                    (memory.supersedes,),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError(f"superseded memory does not exist: {memory.supersedes}")
+                connection.execute(
+                    """
+                    UPDATE explicit_memories
+                    SET status='superseded', valid_to=?
+                    WHERE memory_id=?
+                    """,
+                    (memory.created_at, memory.supersedes),
+                )
+            connection.execute(
+                """
+                INSERT INTO explicit_memories(
+                    memory_id, idempotency_key, event, verbatim, normalized, kind,
+                    scope_type, scope_id, author, source_session_id, source_message_id,
+                    created_at, status, supersedes, valid_to, requires_confirmation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    idempotency_key=excluded.idempotency_key,
+                    event=excluded.event, verbatim=excluded.verbatim,
+                    normalized=excluded.normalized, kind=excluded.kind,
+                    scope_type=excluded.scope_type, scope_id=excluded.scope_id,
+                    author=excluded.author, source_session_id=excluded.source_session_id,
+                    source_message_id=excluded.source_message_id,
+                    created_at=excluded.created_at, status=excluded.status,
+                    supersedes=excluded.supersedes, valid_to=excluded.valid_to,
+                    requires_confirmation=excluded.requires_confirmation
+                """,
+                (
+                    memory.memory_id,
+                    memory.idempotency_key,
+                    memory.event,
+                    memory.verbatim,
+                    memory.normalized,
+                    memory.kind,
+                    memory.scope_type,
+                    memory.scope_id,
+                    memory.author,
+                    memory.source_session_id,
+                    memory.source_message_id,
+                    memory.created_at,
+                    memory.status,
+                    memory.supersedes,
+                    memory.valid_to,
+                    int(memory.requires_confirmation),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM explicit_memories_fts WHERE memory_id = ?",
+                (memory.memory_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO explicit_memories_fts(
+                    memory_id, verbatim, normalized, kind, scope_type, scope_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory.memory_id,
+                    memory.verbatim,
+                    memory.normalized,
+                    memory.kind,
+                    memory.scope_type,
+                    memory.scope_id or "",
+                ),
+            )
+
+    def get_explicit_memory(self, memory_id: str) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM explicit_memories WHERE memory_id = ?", (memory_id,)
+            ).fetchone()
+
+    def explicit_memory_by_idempotency(self, key: str) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM explicit_memories WHERE idempotency_key = ?", (key,)
+            ).fetchone()
+
+    def list_explicit_memory_rows(self) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM explicit_memories ORDER BY created_at, memory_id"
+            ).fetchall()
+
+    def lexical_search_explicit(
+        self, fts_query: str, limit: int, include_superseded: bool = False
+    ) -> list[sqlite3.Row]:
+        status_filter = "" if include_superseded else " AND m.status = 'active'"
+        with self.connection() as connection:
+            return connection.execute(
+                f"""
+                SELECT m.*, bm25(
+                    explicit_memories_fts, 0.0, 2.0, 5.0, 1.0, 0.5, 1.0
+                ) AS bm25_score
+                FROM explicit_memories_fts
+                JOIN explicit_memories AS m
+                  ON m.memory_id = explicit_memories_fts.memory_id
+                WHERE explicit_memories_fts MATCH ?{status_filter}
+                ORDER BY bm25_score, m.created_at DESC
+                LIMIT ?
+                """,
+                (fts_query, limit),
+            ).fetchall()
+
+    def save_explicit_embedding(
+        self,
+        memory_id: str,
+        model: str,
+        vector: bytes,
+        dimension: int,
+        updated_at: str,
+    ) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO explicit_memory_embeddings(
+                    memory_id, model, dimension, embedding, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET model=excluded.model,
+                    dimension=excluded.dimension, embedding=excluded.embedding,
+                    updated_at=excluded.updated_at
+                """,
+                (memory_id, model, dimension, vector, updated_at),
+            )
+
+    def list_explicit_embeddings(self) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM explicit_memory_embeddings"
+            ).fetchall()
+
     def delete_all_index_data(self) -> None:
         with self.transaction(immediate=True) as connection:
             if self._has_vec(connection):
@@ -397,6 +578,9 @@ class Catalog:
             connection.execute("DELETE FROM topics_fts")
             connection.execute("DELETE FROM messages_fts")
             connection.execute("DELETE FROM messages")
+            connection.execute("DELETE FROM explicit_memories_fts")
+            connection.execute("DELETE FROM explicit_memory_embeddings")
+            connection.execute("DELETE FROM explicit_memories")
             connection.execute("DELETE FROM topic_embeddings")
             connection.execute("DELETE FROM topic_sources")
             connection.execute("DELETE FROM topics")
@@ -531,10 +715,85 @@ class Catalog:
             ).fetchone()
             return row is not None
 
+    def enqueue_or_extend_priority_summary(
+        self,
+        session_id: str,
+        from_message: int,
+        to_message: int,
+        now: str,
+    ) -> int | None:
+        """Ensure every explicit remember is covered even during an active job."""
+        if to_message < from_message:
+            return None
+        with self.transaction(immediate=True) as connection:
+            pending = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE session_id=? AND status='pending'
+                  AND type IN ('summary', 'explicit-memory-summary')
+                ORDER BY from_message, id LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if pending is not None:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET from_message=?, to_message=?, type='explicit-memory-summary',
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        min(int(pending["from_message"]), from_message),
+                        max(int(pending["to_message"]), to_message),
+                        now,
+                        pending["id"],
+                    ),
+                )
+                return int(pending["id"])
+            running = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE session_id=? AND status='running'
+                  AND type IN ('summary', 'explicit-memory-summary')
+                ORDER BY to_message DESC, id DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if running is not None:
+                follow_from = max(from_message, int(running["to_message"]) + 1)
+                if follow_from > to_message:
+                    return int(running["id"])
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO jobs(
+                        session_id, from_message, to_message, type, status,
+                        attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'explicit-memory-summary', 'pending', 0, ?, ?)
+                    """,
+                    (session_id, follow_from, to_message, now, now),
+                )
+                return int(cursor.lastrowid) if cursor.rowcount else int(running["id"])
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO jobs(
+                    session_id, from_message, to_message, type, status,
+                    attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, 'explicit-memory-summary', 'pending', 0, ?, ?)
+                """,
+                (session_id, from_message, to_message, now, now),
+            )
+            return int(cursor.lastrowid) if cursor.rowcount else None
+
     def claim_job(self, now: str) -> sqlite3.Row | None:
         with self.transaction(immediate=True) as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at, id LIMIT 1"
+                """
+                SELECT * FROM jobs WHERE status = 'pending'
+                ORDER BY CASE WHEN type = 'explicit-memory-summary' THEN 0 ELSE 1 END,
+                         created_at, id
+                LIMIT 1
+                """
             ).fetchone()
             if row is None:
                 return None

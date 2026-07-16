@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .catalog import Catalog
 from .config import AppConfig
 from .embeddings import FastEmbedEmbedder, OpenAICompatibleEmbedder
+from .explicit_memory import ExplicitMemoryStore
 from .indexer import Indexer
 from .recorder import SessionRecorder
 from .retriever import ContextBuilder, Retriever
@@ -25,6 +26,7 @@ class Services:
     context_builder: ContextBuilder
     summarizer: MemorySummarizer
     job_runner: JobRunner
+    explicit_memory: ExplicitMemoryStore | None = None
 
 
 def build_services(config: AppConfig) -> Services:
@@ -42,7 +44,8 @@ def build_services(config: AppConfig) -> Services:
         embedder_client = OpenAICompatibleEmbedder(config.embeddings)
     embedder = embedder_client if embedder_client.enabled else None
     indexer = Indexer(config, catalog, embedder)
-    retriever = Retriever(config, catalog, recorder, embedder)
+    explicit_memory = ExplicitMemoryStore(config, catalog, recorder, embedder)
+    retriever = Retriever(config, catalog, recorder, embedder, explicit_memory)
     context_builder = ContextBuilder(config, retriever)
     llm = OpenAICompatibleMemoryLLM(
         config.memory_llm,
@@ -62,4 +65,5 @@ def build_services(config: AppConfig) -> Services:
         context_builder=context_builder,
         summarizer=summarizer,
         job_runner=job_runner,
+        explicit_memory=explicit_memory,
     )

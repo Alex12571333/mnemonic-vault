@@ -40,6 +40,8 @@ class RetrievalConfig:
     vector_min_similarity: float = 0.35
     lexical_min_query_coverage: float = 0.34
     rrf_k: int = 60
+    explicit_memory_top_k: int = 5
+    explicit_memory_budget_tokens: int = 600
 
 
 @dataclass(slots=True)

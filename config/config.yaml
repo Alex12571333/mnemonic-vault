@@ -27,6 +27,8 @@ retrieval:
   vector_min_similarity: 0.35
   lexical_min_query_coverage: 0.34
   rrf_k: 60
+  explicit_memory_top_k: 5
+  explicit_memory_budget_tokens: 600
 
 # Optional derived layer. It is never built automatically and never replaces
 # immutable session topic files. Use `python run.py rebuild-global-topics`.

@@ -5,6 +5,10 @@ turns through an `fsync`-backed persistent spool, prefetches bounded memory
 context, and exposes the complete Mnemonic Vault tool set. Pending events replay
 in order after Hermes or Vault restarts; API retries use stable event IDs.
 
+`memory_remember` writes a direct user-requested fact to the immediate explicit-memory
+index. It must not be used for autonomous inferred global memory. For a guaranteed
+path that does not depend on tool calling, use the Vault API or `python run.py remember`.
+
 ```bash
 mkdir -p ~/.hermes/plugins ~/.hermes/skills
 cp -a integrations/hermes/mnemonic_vault ~/.hermes/plugins/

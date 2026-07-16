@@ -89,6 +89,37 @@ def parser() -> argparse.ArgumentParser:
     global_topics.add_argument(
         "--dry-run", action="store_true", help="report clusters without writing files"
     )
+    remember = commands.add_parser(
+        "remember",
+        help="store an explicit user memory immediately without calling the Memory LLM",
+    )
+    remember.add_argument("verbatim", help="exact user-authored text")
+    remember.add_argument("--normalized", help="optional search-friendly rendering")
+    remember.add_argument(
+        "--kind",
+        choices=(
+            "fact",
+            "preference",
+            "decision",
+            "configuration",
+            "identity",
+            "constraint",
+            "task",
+            "correction",
+        ),
+        default="fact",
+    )
+    remember.add_argument(
+        "--scope-type",
+        choices=("global", "agent", "project", "session"),
+        default="global",
+    )
+    remember.add_argument("--scope-id")
+    remember.add_argument("--source-session")
+    remember.add_argument("--source-message", type=int)
+    remember.add_argument("--idempotency-key")
+    remember.add_argument("--supersedes")
+    remember.add_argument("--created-at")
     return result
 
 
@@ -146,6 +177,28 @@ def main() -> int:
         return 0
 
     services = build_services(config)
+    if args.command == "remember":
+        if services.explicit_memory is None:
+            raise SystemExit("explicit memory is unavailable")
+        print(
+            json.dumps(
+                services.explicit_memory.remember(
+                    args.verbatim,
+                    normalized=args.normalized,
+                    kind=args.kind,
+                    scope_type=args.scope_type,
+                    scope_id=args.scope_id,
+                    source_session_id=args.source_session,
+                    source_message_id=args.source_message,
+                    idempotency_key=args.idempotency_key,
+                    supersedes=args.supersedes,
+                    created_at=args.created_at,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "rebuild-index":
         print(json.dumps(services.indexer.rebuild(args.with_embeddings), ensure_ascii=False))
         return 0

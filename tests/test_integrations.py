@@ -38,6 +38,14 @@ class FakeVaultClient:
             "source_ranges": [{"session_id": "session-a", "from": 31, "to": 36}],
         }]}
 
+    def remember(self, verbatim: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("remember", verbatim, kwargs))
+        return {
+            "stored": True,
+            "memory_id": "mem-test",
+            "available_for_recall": True,
+        }
+
     def open_topic(self, topic_id: str) -> dict[str, Any]:
         self.calls.append(("open", topic_id))
         return {"id": topic_id}
@@ -93,10 +101,19 @@ class HermesProviderTests(unittest.TestCase):
             self.assertIn("session-a:31-36", context)
             self.assertEqual(
                 [schema["name"] for schema in provider.get_tool_schemas()],
-                ["memory_search", "memory_get", "memory_open_topic",
+                ["memory_search", "memory_remember", "memory_get", "memory_open_topic",
                  "memory_open_global_topic", "memory_expand_topic",
                  "memory_read_turns", "memory_search_transcript"],
             )
+            remembered = json.loads(provider.handle_tool_call(
+                "memory_remember",
+                {
+                    "verbatim": "Запомни: production на .14",
+                    "kind": "configuration",
+                    "scope": {"type": "project", "id": "vault"},
+                },
+            ))
+            self.assertEqual(remembered["memory_id"], "mem-test")
             opened = json.loads(provider.handle_tool_call(
                 "memory_open_topic", {"topic_id": "topic-a"}))
             self.assertEqual(opened, {"id": "topic-a"})
@@ -128,8 +145,8 @@ class HermesProviderTests(unittest.TestCase):
         manifest = json.loads((root / "integrations/openclaw/mnemonic-vault/"
                                       "openclaw.plugin.json").read_text())
         self.assertEqual(manifest["kind"], "memory")
-        self.assertEqual(manifest["version"], "0.4.1")
-        self.assertEqual(len(manifest["contracts"]["tools"]), 7)
+        self.assertEqual(manifest["version"], "0.5.0")
+        self.assertEqual(len(manifest["contracts"]["tools"]), 8)
 
 
 class IntegrationHelpersTests(unittest.TestCase):
@@ -145,6 +162,22 @@ class IntegrationHelpersTests(unittest.TestCase):
 
     def test_empty_recall_context_is_omitted(self):
         self.assertEqual(format_memory_context({"topics": []}), "")
+
+    def test_explicit_recall_context_does_not_require_topics(self):
+        context = format_memory_context({
+            "topics": [],
+            "explicit_memories": [{
+                "memory_id": "mem-a",
+                "text": "Production runs on .14",
+                "kind": "configuration",
+                "scope": {"type": "project", "id": "vault"},
+                "source_session_id": "session-a",
+                "source_message_id": 2,
+                "status": "active",
+            }],
+        })
+        self.assertIn("Explicit memory: mem-a", context)
+        self.assertIn("project:vault", context)
 
 
 if __name__ == "__main__":
