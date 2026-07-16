@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-mnemonic-vault",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "type": "module",
   "private": true,
   "description": "Native OpenClaw memory slot for Mnemonic Vault",

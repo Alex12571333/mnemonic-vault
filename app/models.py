@@ -107,6 +107,7 @@ class SearchHit:
     vector_similarity: float | None = None
     rrf_score: float = 0.0
     is_latest: bool = True
+    global_topic_id: str | None = None
     related_older_topic_ids: list[str] = field(default_factory=list)
     source_fragments: list[dict[str, Any]] = field(default_factory=list)
 
@@ -123,6 +124,9 @@ class SearchHit:
             "rrf": round(self.rrf_score, 6),
         }
         value["is_latest"] = self.is_latest
+        if self.global_topic_id:
+            value["global_topic_id"] = self.global_topic_id
+            value["global_projection_available"] = True
         if self.related_older_topic_ids:
             value["related_older_topic_ids"] = self.related_older_topic_ids
         if include_summary:

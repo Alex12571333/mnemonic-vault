@@ -97,6 +97,17 @@ class VaultClient:
             f"/v1/memory/topics/{urllib.parse.quote(topic_id, safe='')}"
         )
 
+    def open_global_topic(
+        self, global_topic_id: str, *, max_timeline_entries: int = 50
+    ) -> dict[str, Any]:
+        return self._request(
+            "/v1/memory/global-topics/"
+            f"{urllib.parse.quote(global_topic_id, safe='')}?"
+            + urllib.parse.urlencode(
+                {"max_timeline_entries": str(max_timeline_entries)}
+            )
+        )
+
     def expand_topic(
         self,
         topic_id: str,

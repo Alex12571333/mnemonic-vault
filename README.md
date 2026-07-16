@@ -64,6 +64,8 @@ POST /v1/memory/search
 POST /v1/memory/search-transcript
 GET  /v1/memory/topics/{topic_id}
 POST /v1/memory/topics/{topic_id}/expand
+GET  /v1/memory/global-topics
+GET  /v1/memory/global-topics/{global_topic_id}
 GET  /v1/sessions/{session_id}/turns?from=1&to=20
 GET  /v1/sessions/{session_id}/aliases
 ```
@@ -128,6 +130,33 @@ RRF используется только для порядка уже реле�
 `session_started_at` до BM25/vector top-k, поэтому нужная историческая версия не
 вытесняется более новыми результатами.
 
+## Глобальные проекции тем
+
+Сессионные topic-файлы никогда не объединяются и не удаляются. Когда у одной темы
+накопится достаточно версий, отдельная offline-команда может построить производный
+слой:
+
+```text
+data/global-topics/<global-topic-id>/
+├── current.md
+├── timeline.md
+└── sources.json
+```
+
+`current.md` ссылается на последнюю сессионную версию, `timeline.md` перечисляет
+историю, а `sources.json` хранит все исходные topic IDs. Кластеризация консервативная,
+детерминированная и не вызывает LLM. По умолчанию требуется 12 версий, а rebuild не
+запускается автоматически:
+
+```bash
+python run.py rebuild-global-topics --dry-run
+python run.py rebuild-global-topics
+```
+
+Проекцию можно удалить и полностью восстановить из session topics. Поисковые карточки
+получают `global_topic_id` только после её создания; `memory_open_global_topic`
+открывает ограниченный current/timeline пакет, не заменяя source-level retrieval.
+
 ## Фоновые jobs и обслуживание
 
 API запускает job runner автоматически. Его можно запускать отдельно:
@@ -142,6 +171,8 @@ python run.py retry-failed
 python run.py retry-failed --session session-a83f
 python run.py migrate-session-ids --dry-run
 python run.py migrate-session-ids
+python run.py rebuild-global-topics --dry-run
+python run.py rebuild-global-topics
 ```
 
 Незавершённые jobs при старте переводятся обратно в `pending`. После трёх неудачных
@@ -155,9 +186,9 @@ python run.py migrate-session-ids
 
 ## Нативные интеграции агентов
 
-Версия 0.3.2 включает два lossless-адаптера:
+Версия 0.4.0 включает два lossless-адаптера:
 
-- OpenClaw memory-slot plugin с lifecycle hooks, шестью memory tools и встроенным skill;
+- OpenClaw memory-slot plugin с lifecycle hooks, семью memory tools и встроенным skill;
 - Hermes Agent `MemoryProvider` с persistent spool, bounded prefetch и теми же tools.
 
 Оба адаптера автоматически сохраняют ходы, подмешивают только небольшой релевантный

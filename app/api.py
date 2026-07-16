@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .config import AppConfig
+from .global_topics import GlobalTopicStore
 from .models import Session
 from .service import Services, build_services
 
@@ -111,6 +112,7 @@ def create_app(
     start_worker: bool = True,
 ) -> FastAPI:
     services = services or build_services(AppConfig.load(config_path))
+    global_topics = GlobalTopicStore(services.config)
     stop_event = threading.Event()
     worker: threading.Thread | None = None
 
@@ -132,7 +134,7 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.3.2",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.state.services = services
@@ -232,6 +234,19 @@ def create_app(
             payload.include_sources,
             payload.total_context_budget_tokens,
         )
+
+    @app.get("/v1/memory/global-topics")
+    def list_global_topics(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return {"topics": global_topics.list_cards(limit)}
+
+    @app.get("/v1/memory/global-topics/{global_topic_id}")
+    def open_global_topic(
+        global_topic_id: str,
+        max_timeline_entries: int = Query(default=50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return global_topics.get(global_topic_id, max_timeline_entries)
 
     @app.get("/v1/memory/topics/{topic_id}")
     def open_topic(topic_id: str) -> dict[str, Any]:

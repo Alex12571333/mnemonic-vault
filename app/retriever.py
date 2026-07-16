@@ -9,6 +9,7 @@ from typing import Any, Iterable
 from .catalog import Catalog
 from .config import AppConfig
 from .embeddings import Embedder, cosine_similarity, pack_vector, unpack_vector
+from .global_topics import GlobalTopicStore
 from .models import Message, SearchHit, Topic
 from .recorder import SessionRecorder
 from .session_aliases import SessionAliasStore
@@ -176,6 +177,7 @@ class Retriever:
         self.session_aliases = SessionAliasStore(
             config.storage.root / "session-aliases.json"
         )
+        self.global_topics = GlobalTopicStore(config)
 
     def search(self, query: str, max_topics: int | None = None) -> list[SearchHit]:
         if not query.strip():
@@ -274,11 +276,15 @@ class Retriever:
                     candidate.topic.session_started_at, requested_date
                 )
             ]
-        return self._diversify(
+        selected = self._diversify(
             candidates,
             max_topics or retrieval.final_top_k,
             preserve_history=bool(HISTORICAL_QUERY.search(query)),
         )
+        projection_mapping = self.global_topics.topic_mapping()
+        for hit in selected:
+            hit.global_topic_id = projection_mapping.get(hit.topic.id)
+        return selected
 
     def get_topic(self, topic_id: str) -> Topic:
         validate_id(topic_id, "topic id")

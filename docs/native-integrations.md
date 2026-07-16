@@ -1,7 +1,7 @@
 # Native OpenClaw and Hermes integrations
 
-Mnemonic Vault 0.3 ships two native adapters. Both use the same loopback HTTP
-API, expose the same six memory tools, automatically record completed turns, and
+Mnemonic Vault 0.4 ships two native adapters. Both use the same loopback HTTP
+API, expose the same seven memory tools, automatically record completed turns, and
 inject only a bounded amount of retrieved history. Retrieval stays
 non-generative; the Memory LLM continues to run only in the background
 summarizer.
@@ -22,6 +22,7 @@ The integrations expose:
 
 - `memory_search(query)` — hybrid topic search with a summary budget;
 - `memory_get(topic_id)` and `memory_open_topic(topic_id)` — open one summary;
+- `memory_open_global_topic(global_topic_id)` — open a bounded current/timeline projection;
 - `memory_expand_topic(topic_id, query)` — exact fragments from topic ranges;
 - `memory_read_turns(session_id, from_turn, to_turn)` — explicit transcript range;
 - `memory_search_transcript(query, session_id?)` — last-resort raw search.

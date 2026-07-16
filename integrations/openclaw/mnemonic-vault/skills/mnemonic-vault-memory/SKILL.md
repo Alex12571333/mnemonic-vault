@@ -12,8 +12,9 @@ Mnemonic Vault automatically supplies a small relevant context before ordinary t
 1. Call `memory_search` with the user's current question, not the whole conversation.
 2. Answer from the returned topic cards and summaries when they are sufficient.
 3. Call `memory_open_topic` when the summary was omitted or a selected topic needs inspection.
-4. Call `memory_expand_topic` for exact commands, versions, numbers, dates, parameters, addresses, or error text.
-5. Use `memory_read_turns` only for a known source range. Use `memory_search_transcript` when no topic has enough detail.
+4. If a result contains `global_topic_id`, call `memory_open_global_topic` when the current state or a cross-session timeline is useful.
+5. Call `memory_expand_topic` for exact commands, versions, numbers, dates, parameters, addresses, or error text.
+6. Use `memory_read_turns` only for a known source range. Use `memory_search_transcript` when no topic has enough detail.
 
 Set `include_sources` to `always` for exact-value requests and to `auto` otherwise. Keep `max_topics` small unless the request explicitly spans several projects.
 
@@ -30,6 +31,7 @@ Set `include_sources` to `always` for exact-value requests and to `auto` otherwi
 
 - `memory_search`: hybrid BM25/vector recall with bounded summaries.
 - `memory_get` / `memory_open_topic`: read one topic and its summary.
+- `memory_open_global_topic`: read a rebuildable current projection, timeline, and its source topic IDs.
 - `memory_expand_topic`: retrieve precise fragments only inside a topic's source ranges.
 - `memory_read_turns`: read an explicit inclusive turn range.
 - `memory_search_transcript`: last-resort search across raw turns.

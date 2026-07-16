@@ -28,6 +28,13 @@ retrieval:
   lexical_min_query_coverage: 0.34
   rrf_k: 60
 
+# Optional derived layer. It is never built automatically and never replaces
+# immutable session topic files. Use `python run.py rebuild-global-topics`.
+global_topics:
+  minimum_versions: 12
+  title_similarity_threshold: 0.50
+  lexical_similarity_threshold: 0.72
+
 api:
   bearer_token_env: "MNEMONIC_VAULT_API_TOKEN"
   max_request_bytes: 262144

@@ -42,6 +42,10 @@ class FakeVaultClient:
         self.calls.append(("open", topic_id))
         return {"id": topic_id}
 
+    def open_global_topic(self, global_topic_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("open-global", global_topic_id, kwargs))
+        return {"id": global_topic_id}
+
     def expand_topic(self, topic_id: str, query: str, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("expand", topic_id, query, kwargs))
         return {"fragments": []}
@@ -90,11 +94,17 @@ class HermesProviderTests(unittest.TestCase):
             self.assertEqual(
                 [schema["name"] for schema in provider.get_tool_schemas()],
                 ["memory_search", "memory_get", "memory_open_topic",
-                 "memory_expand_topic", "memory_read_turns", "memory_search_transcript"],
+                 "memory_open_global_topic", "memory_expand_topic",
+                 "memory_read_turns", "memory_search_transcript"],
             )
             opened = json.loads(provider.handle_tool_call(
                 "memory_open_topic", {"topic_id": "topic-a"}))
             self.assertEqual(opened, {"id": "topic-a"})
+            opened_global = json.loads(provider.handle_tool_call(
+                "memory_open_global_topic",
+                {"global_topic_id": "global-a", "max_timeline_entries": 20},
+            ))
+            self.assertEqual(opened_global, {"id": "global-a"})
             provider.shutdown()
 
     def test_manifest_and_bundled_skill_match_sources(self):
@@ -106,8 +116,8 @@ class HermesProviderTests(unittest.TestCase):
         manifest = json.loads((root / "integrations/openclaw/mnemonic-vault/"
                                       "openclaw.plugin.json").read_text())
         self.assertEqual(manifest["kind"], "memory")
-        self.assertEqual(manifest["version"], "0.3.2")
-        self.assertEqual(len(manifest["contracts"]["tools"]), 6)
+        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertEqual(len(manifest["contracts"]["tools"]), 7)
 
 
 class IntegrationHelpersTests(unittest.TestCase):

@@ -34,6 +34,7 @@ describe("mnemonic-vault OpenClaw plugin", () => {
       "memory_search",
       "memory_get",
       "memory_open_topic",
+      "memory_open_global_topic",
       "memory_expand_topic",
       "memory_read_turns",
       "memory_search_transcript",

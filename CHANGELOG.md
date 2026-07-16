@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — 2026-07-16
+
+- Add an optional, rebuildable global-topic layer over immutable session summaries.
+- Build conservative cross-session clusters without an LLM and only after the
+  configured number of topic versions has accumulated.
+- Generate atomic `current.md`, `timeline.md`, and `sources.json` projections while
+  keeping every original topic Markdown file byte-for-byte unchanged.
+- Expose global projection IDs in search cards and add bounded read APIs plus the
+  `memory_open_global_topic` tool to OpenClaw and Hermes.
+- Keep projection creation manual through `rebuild-global-topics`; the default
+  threshold is 12 versions, so the new layer does not alter small archives.
+
 ## 0.3.2 — 2026-07-16
 
 - Add a reversible `migrate-session-ids` command and portable alias manifest for

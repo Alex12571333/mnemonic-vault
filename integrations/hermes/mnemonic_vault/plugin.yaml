@@ -1,5 +1,5 @@
 name: mnemonic_vault
-version: 0.3.2
+version: 0.4.0
 description: "Mnemonic Vault file-first long-term memory with bounded hybrid recall and source-level expansion."
 requires_env: []
 hooks:
