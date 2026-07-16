@@ -43,6 +43,13 @@ class RetrievalConfig:
 
 
 @dataclass(slots=True)
+class GlobalTopicsConfig:
+    minimum_versions: int = 12
+    title_similarity_threshold: float = 0.5
+    lexical_similarity_threshold: float = 0.72
+
+
+@dataclass(slots=True)
 class ApiConfig:
     bearer_token_env: str = "MNEMONIC_VAULT_API_TOKEN"
     max_request_bytes: int = 262_144
@@ -76,6 +83,7 @@ class AppConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     summarization: SummarizationConfig = field(default_factory=SummarizationConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    global_topics: GlobalTopicsConfig = field(default_factory=GlobalTopicsConfig)
     memory_llm: MemoryLLMConfig = field(default_factory=MemoryLLMConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
@@ -129,6 +137,7 @@ class AppConfig:
             storage=storage,
             summarization=SummarizationConfig(**raw.get("summarization", {})),
             retrieval=RetrievalConfig(**raw.get("retrieval", {})),
+            global_topics=GlobalTopicsConfig(**raw.get("global_topics", {})),
             memory_llm=MemoryLLMConfig(**llm_raw),
             embeddings=EmbeddingsConfig(**embeddings_raw),
             api=ApiConfig(**raw.get("api", {})),

@@ -72,6 +72,12 @@ export class VaultClient {
     async openTopic(topicId) {
         return this.request(`/v1/memory/topics/${encodeURIComponent(topicId)}`);
     }
+    async openGlobalTopic(globalTopicId, maxTimelineEntries = 50) {
+        const query = new URLSearchParams({
+            max_timeline_entries: String(maxTimelineEntries),
+        });
+        return this.request(`/v1/memory/global-topics/${encodeURIComponent(globalTopicId)}?${query.toString()}`);
+    }
     async expandTopic(topicId, query, maxFragments = 5, tokenBudget) {
         return this.request(`/v1/memory/topics/${encodeURIComponent(topicId)}/expand`, {
             method: "POST",

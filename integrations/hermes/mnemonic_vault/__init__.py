@@ -304,6 +304,19 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             "required": ["topic_id"],
             "additionalProperties": False,
         }
+        global_topic = {
+            "type": "object",
+            "properties": {
+                "global_topic_id": {"type": "string"},
+                "max_timeline_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                },
+            },
+            "required": ["global_topic_id"],
+            "additionalProperties": False,
+        }
         return [
             _tool(
                 "memory_search",
@@ -334,6 +347,11 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             ),
             _tool("memory_get", "Open one topic and its complete summary.", topic),
             _tool("memory_open_topic", "Open one topic and its complete summary.", topic),
+            _tool(
+                "memory_open_global_topic",
+                "Open a rebuildable current view, timeline, and source-topic list.",
+                global_topic,
+            ),
             _tool(
                 "memory_expand_topic",
                 "Retrieve exact source fragments inside a topic's transcript ranges.",
@@ -397,6 +415,11 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                 )
             elif tool_name in {"memory_get", "memory_open_topic"}:
                 value = self._client.open_topic(args["topic_id"])
+            elif tool_name == "memory_open_global_topic":
+                value = self._client.open_global_topic(
+                    args["global_topic_id"],
+                    max_timeline_entries=args.get("max_timeline_entries", 50),
+                )
             elif tool_name == "memory_expand_topic":
                 value = self._client.expand_topic(
                     args["topic_id"],

@@ -10,6 +10,7 @@ from pathlib import Path
 from app.config import AppConfig
 from app.models import utc_or_local_now
 from app.evaluation import evaluate_retrieval
+from app.global_topics import GlobalTopicStore
 from app.service import build_services
 from app.session_aliases import migrate_session_ids
 from app.storage import (
@@ -75,6 +76,19 @@ def parser() -> argparse.ArgumentParser:
     migrate.add_argument(
         "--dry-run", action="store_true", help="report aliases without writing them"
     )
+    global_topics = commands.add_parser(
+        "rebuild-global-topics",
+        help="recreate optional current/timeline projections from session topics",
+    )
+    global_topics.add_argument(
+        "--minimum-versions",
+        type=int,
+        default=None,
+        help="override the configured minimum number of session topic versions",
+    )
+    global_topics.add_argument(
+        "--dry-run", action="store_true", help="report clusters without writing files"
+    )
     return result
 
 
@@ -113,6 +127,18 @@ def main() -> int:
         print(
             json.dumps(
                 migrate_session_ids(config, instances, dry_run=args.dry_run),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "rebuild-global-topics":
+        print(
+            json.dumps(
+                GlobalTopicStore(config).rebuild(
+                    minimum_versions=args.minimum_versions,
+                    dry_run=args.dry_run,
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
