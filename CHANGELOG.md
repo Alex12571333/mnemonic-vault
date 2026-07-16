@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.2 — 2026-07-16
+
+- Add a reversible `migrate-session-ids` command and portable alias manifest for
+  legacy process-scoped OpenClaw and Hermes session folders.
+- Derive adapter event IDs from stable turn identity and enforce their idempotency
+  globally, including re-emission after an agent restart or session recovery.
+- Persist finalized-session recovery redirects in the durable spool and route later
+  messages and `session_end` events through the complete recovery chain.
+- Parse explicit years and dates deterministically, constrain lexical/vector
+  candidates by `session_started_at` before top-k ranking, and keep historical versions.
+
 ## 0.3.1 — 2026-07-15
 
 - Keep one logical OpenClaw or Hermes chat in one Vault session across agent restarts

@@ -9,7 +9,9 @@ summarizer.
 Before either adapter contacts the API, captured events are appended and
 `fsync`ed to `data/spool/openclaw.jsonl` or `data/spool/hermes.jsonl`. Successful
 delivery appends a durable acknowledgement. Pending events are replayed in order
-after an agent or Vault restart, and stable event IDs make retries idempotent.
+after an agent or Vault restart. Event IDs are derived from the persistent agent
+identity, external chat, role, and stable run/message-sequence identity, so replaying
+the lifecycle hook itself remains idempotent after a process restart.
 Permanent invalid events are fsync-quarantined in adjacent `*.dead-letter.jsonl`
 files so they cannot block later turns. Authentication failures stop delivery;
 network errors and server failures remain pending for retry.
@@ -101,6 +103,16 @@ Recall is prefetched in a small thread pool with a bounded timeout.
 `MNEMONIC_VAULT_AGENT_INSTANCE_ID` must stay unchanged across process restarts.
 Use a distinct stable value for each independent Hermes installation. Upgrading
 from 0.3.0 creates one new stable session boundary; subsequent restarts keep using it.
+To make old physical folders discoverable as one logical session without rewriting
+their transcripts, create the portable alias manifest:
+
+```bash
+python run.py migrate-session-ids --dry-run
+python run.py migrate-session-ids
+```
+
+Use `--agent-instance AGENT=INSTANCE` when the installation identity differs from
+`openclaw-main` or `hermes-main`.
 
 ## Verified `.14` topology
 

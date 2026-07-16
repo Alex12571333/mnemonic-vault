@@ -65,6 +65,7 @@ POST /v1/memory/search-transcript
 GET  /v1/memory/topics/{topic_id}
 POST /v1/memory/topics/{topic_id}/expand
 GET  /v1/sessions/{session_id}/turns?from=1&to=20
+GET  /v1/sessions/{session_id}/aliases
 ```
 
 Пример:
@@ -89,8 +90,10 @@ curl -sS http://127.0.0.1:8765/v1/memory/search \
 }
 ```
 
-Повтор с той же парой `session_id + external_event_id` возвращает уже сохранённое
-сообщение и не добавляет вторую строку в transcript.
+Произвольный `external_event_id` идемпотентен внутри сессии. Нативные адаптеры
+создают детерминированные `event-*` из постоянного ID установки, внешнего ID чата,
+роли и ID/номера хода; такие события идемпотентны глобально, в том числе после
+рестарта агента или перенаправления в recovery-сессию.
 
 ## Надёжная доставка
 
@@ -104,14 +107,16 @@ data/spool/hermes.dead-letter.jsonl
 ```
 
 После подтверждения API в spool дописывается отметка `delivered`. Неподтверждённые
-события повторяются после восстановления Vault или перезапуска агента. Идемпотентность
-API исключает дубли, если сервер сохранил сообщение, но HTTP-ответ потерялся.
+события повторяются после восстановления Vault или перезапуска агента. Один и тот же
+заново эмитированный lifecycle hook получает тот же ID, поэтому повтор не создаёт дубль.
 
 Идентификатор Vault-сессии строится из постоянного имени установки агента и внешнего
 ID чата, поэтому рестарт процесса не дробит историю. Постоянные ошибки `400/413/422`
 карантинируются в dead-letter и не блокируют следующие события; `401/403` останавливают
 доставку до исправления конфигурации, сетевые ошибки и `5xx` повторяются. Append в уже
 завершённую сессию автоматически переносится в детерминированную recovery-сессию.
+Redirect хранится в spool, поэтому следующие сообщения и `session_end` продолжают и
+закрывают recovery-сессию даже после рестарта процесса.
 
 ## Relevance и transcript index
 
@@ -119,6 +124,9 @@ ID чата, поэтому рестарт процесса не дробит и
 RRF используется только для порядка уже релевантных тем. Полный архив ищется через
 восстанавливаемый `messages_fts`; `search_transcript` больше не загружает все JSONL.
 `rebuild-index` восстанавливает topic index, message index и event-id каталог из файлов.
+Явный год или дата извлекается regex и ограничивает кандидатов по
+`session_started_at` до BM25/vector top-k, поэтому нужная историческая версия не
+вытесняется более новыми результатами.
 
 ## Фоновые jobs и обслуживание
 
@@ -132,14 +140,22 @@ python run.py reembed-all
 python run.py resummarize --session session-a83f
 python run.py retry-failed
 python run.py retry-failed --session session-a83f
+python run.py migrate-session-ids --dry-run
+python run.py migrate-session-ids
 ```
 
 Незавершённые jobs при старте переводятся обратно в `pending`. После трёх неудачных
 попыток job получает статус `failed`; исходный transcript при этом уже сохранён.
 
+`migrate-session-ids` группирует старые папки 0.3.0 по `agent + external_session_id`
+и пишет переносимый `data/session-aliases.json`. Transcript-файлы не объединяются,
+не перенумеровываются и не изменяются; scoped transcript search по каноническому ID
+читает все физические папки alias-группы. Для нестандартной установки используйте
+`--agent-instance openclaw=my-stable-id` или аналогичный override для Hermes.
+
 ## Нативные интеграции агентов
 
-Версия 0.3 включает два lossless-адаптера:
+Версия 0.3.2 включает два lossless-адаптера:
 
 - OpenClaw memory-slot plugin с lifecycle hooks, шестью memory tools и встроенным skill;
 - Hermes Agent `MemoryProvider` с persistent spool, bounded prefetch и теми же tools.

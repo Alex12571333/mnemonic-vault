@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,6 +11,7 @@ from .config import AppConfig
 from .embeddings import Embedder, cosine_similarity, pack_vector, unpack_vector
 from .models import Message, SearchHit, Topic
 from .recorder import SessionRecorder
+from .session_aliases import SessionAliasStore
 from .storage import estimate_tokens, read_topic, validate_id
 
 
@@ -38,6 +40,50 @@ HISTORICAL_QUERY = re.compile(
     r"предыдущ|прежн|previously|before|back\s+then|originally|at\s+the\s+time)",
     re.IGNORECASE,
 )
+EXPLICIT_ISO_DATE = re.compile(
+    r"\b(?P<year>(?:19|20)\d{2})(?:[-/.](?P<month>0?[1-9]|1[0-2])"
+    r"(?:[-/.](?P<day>0?[1-9]|[12]\d|3[01]))?)?\b"
+)
+EXPLICIT_EUROPEAN_DATE = re.compile(
+    r"\b(?P<day>0?[1-9]|[12]\d|3[01])[./-]"
+    r"(?P<month>0?[1-9]|1[0-2])[./-](?P<year>(?:19|20)\d{2})\b"
+)
+MONTH_NAMES = {
+    "январ": 1,
+    "феврал": 2,
+    "март": 3,
+    "апрел": 4,
+    "май": 5,
+    "мая": 5,
+    "мае": 5,
+    "июн": 6,
+    "июл": 7,
+    "август": 8,
+    "сентябр": 9,
+    "октябр": 10,
+    "ноябр": 11,
+    "декабр": 12,
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+QUERY_STOP_WORDS = {
+    "а", "был", "была", "были", "в", "во", "где", "год", "года", "году",
+    "для", "и", "из", "использовали", "использовать", "как", "какая", "какие",
+    "какой", "какую", "когда", "мы", "на", "наш", "наша", "наше", "о", "по",
+    "применяли", "тогда", "у", "что", "это", "я", "a", "an", "at", "did",
+    "do", "for", "how", "in", "is", "of", "on", "our", "the", "then", "used",
+    "we", "what", "when", "which",
+}
 
 
 def tokenize_query(query: str) -> list[str]:
@@ -47,6 +93,67 @@ def tokenize_query(query: str) -> list[str]:
         if len(token) > 1 and token not in result:
             result.append(token)
     return result
+
+
+def relevance_query_tokens(query: str) -> list[str]:
+    tokens = tokenize_query(query)
+    filtered = [
+        token
+        for token in tokens
+        if token not in QUERY_STOP_WORDS
+        and not re.fullmatch(r"(?:19|20)\d{2}", token)
+        and not EXPLICIT_ISO_DATE.fullmatch(token)
+        and not EXPLICIT_EUROPEAN_DATE.fullmatch(token)
+    ]
+    return filtered or tokens
+
+
+def temporal_scope(query: str) -> tuple[int, int | None, int | None] | None:
+    """Extract an explicit calendar constraint without using a generative model."""
+    match = EXPLICIT_EUROPEAN_DATE.search(query) or EXPLICIT_ISO_DATE.search(query)
+    if not match:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month")) if match.groupdict().get("month") else None
+    day = int(match.group("day")) if match.groupdict().get("day") else None
+    lowered = query.lower()
+    if month is None:
+        window = lowered[
+            max(0, match.start("year") - 32) : min(
+                len(lowered), match.end("year") + 32
+            )
+        ]
+        for stem, value in MONTH_NAMES.items():
+            if re.search(rf"\b{re.escape(stem)}\w*\b", window):
+                month = value
+                break
+    return year, month, day
+
+
+def date_matches_scope(
+    value: str, scope: tuple[int, int | None, int | None]
+) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    year, month, day = scope
+    return (
+        parsed.year == year
+        and (month is None or parsed.month == month)
+        and (day is None or parsed.day == day)
+    )
+
+
+def temporal_prefix(scope: tuple[int, int | None, int | None]) -> str:
+    year, month, day = scope
+    if month is None:
+        return f"{year:04d}-"
+    if day is None:
+        return f"{year:04d}-{month:02d}-"
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def fts_query(query: str) -> str:
@@ -66,18 +173,32 @@ class Retriever:
         self.catalog = catalog
         self.recorder = recorder
         self.embedder = embedder
+        self.session_aliases = SessionAliasStore(
+            config.storage.root / "session-aliases.json"
+        )
 
     def search(self, query: str, max_topics: int | None = None) -> list[SearchHit]:
         if not query.strip():
             return []
         retrieval = self.config.retrieval
+        requested_date = temporal_scope(query)
+        date_prefix = temporal_prefix(requested_date) if requested_date else None
+        temporal_topic_ids = (
+            self.catalog.topic_ids_for_session_started_prefix(date_prefix)
+            if date_prefix
+            else None
+        )
+        if temporal_topic_ids == []:
+            return []
         lexical_rows = []
         expression = fts_query(query)
         if expression:
             lexical_rows = self.catalog.lexical_search(
-                expression, retrieval.lexical_top_k
+                expression,
+                retrieval.lexical_top_k,
+                session_started_prefix=date_prefix,
             )
-        query_tokens = set(tokenize_query(query))
+        query_tokens = set(relevance_query_tokens(query))
         lexical_relevance: dict[str, float] = {}
         for row in lexical_rows:
             searchable = " ".join(
@@ -89,7 +210,9 @@ class Retriever:
                 if query_tokens
                 else 0.0
             )
-        vector_scores = self._vector_search(query, retrieval.vector_top_k)
+        vector_scores = self._vector_search(
+            query, retrieval.vector_top_k, temporal_topic_ids
+        )
 
         lexical_ids = [
             str(row["id"])
@@ -143,6 +266,14 @@ class Retriever:
                     rrf_score=raw_scores[topic_id],
                 )
             )
+        if requested_date:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if date_matches_scope(
+                    candidate.topic.session_started_at, requested_date
+                )
+            ]
         return self._diversify(
             candidates,
             max_topics or retrieval.final_top_k,
@@ -239,8 +370,11 @@ class Retriever:
         expression = fts_query(query)
         if not expression:
             return []
+        session_ids = self.session_aliases.members(session_id) if session_id else None
         rows = self.catalog.search_messages(
-            expression, max(max_fragments * 8, 40), session_id=session_id
+            expression,
+            max(max_fragments * 8, 40),
+            session_ids=session_ids,
         )
         candidates = [
             Message(
@@ -255,15 +389,27 @@ class Retriever:
         ranked = rank_messages(candidates, query, max_fragments=max_fragments)
         return ranked
 
-    def _vector_search(self, query: str, limit: int) -> dict[str, float]:
+    def _vector_search(
+        self,
+        query: str,
+        limit: int,
+        topic_ids: list[str] | None = None,
+    ) -> dict[str, float]:
         if self.embedder is None:
             return {}
         try:
             query_vector = self.embedder.embed([query])[0]
         except Exception:
             return {}
-        indexed = self.catalog.vector_search(
-            self.embedder.model, pack_vector(query_vector), len(query_vector), limit
+        indexed = (
+            []
+            if topic_ids is not None
+            else self.catalog.vector_search(
+                self.embedder.model,
+                pack_vector(query_vector),
+                len(query_vector),
+                limit,
+            )
         )
         scores = {
             str(item["topic_id"]): float(item["cosine_similarity"])
@@ -272,7 +418,7 @@ class Retriever:
         if len(scores) >= limit:
             return scores
         scored: list[tuple[float, str]] = []
-        for row in self.catalog.list_embeddings():
+        for row in self.catalog.list_embeddings(topic_ids):
             if row["model"] != self.embedder.model:
                 continue
             if row["topic_id"] in scores:

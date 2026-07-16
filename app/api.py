@@ -132,7 +132,7 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.3.1",
+        version="0.3.2",
         lifespan=lifespan,
     )
     app.state.services = services
@@ -213,6 +213,13 @@ def create_app(
             raise HTTPException(status_code=422, detail="to must be >= from")
         messages = services.recorder.read_turns(session_id, from_turn, to_turn)
         return {"session_id": session_id, "turns": [item.to_dict() for item in messages]}
+
+    @app.get("/v1/sessions/{session_id}/aliases")
+    def session_aliases(session_id: str) -> dict[str, Any]:
+        alias = services.retriever.session_aliases.describe(session_id)
+        if alias is None:
+            raise HTTPException(status_code=404, detail="session alias not found")
+        return alias
 
     @app.post("/v1/memory/search")
     def search_memory(payload: SearchRequest) -> dict[str, Any]:

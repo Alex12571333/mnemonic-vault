@@ -17,7 +17,7 @@ from .indexer import Indexer
 from .embeddings import cosine_similarity, unpack_vector
 from .models import Message, SourceRange, Topic, utc_or_local_now
 from .recorder import SessionRecorder
-from .retriever import tokenize_query
+from .retriever import relevance_query_tokens, tokenize_query
 from .storage import (
     atomic_write_json,
     estimate_tokens,
@@ -475,7 +475,7 @@ class MemorySummarizer:
         if not topics:
             return []
         query = "\n".join(message.text for message in messages)
-        query_tokens = set(tokenize_query(query))
+        query_tokens = set(relevance_query_tokens(query))
         words = sorted(query_tokens)[:24]
         expression = " OR ".join(
             f'"{word.replace(chr(34), chr(34) * 2)}"' for word in words

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -84,7 +85,12 @@ class SessionRecorder:
         if external_event_id:
             external_event_id = validate_id(external_event_id, "external event id")
         path = self.locate(session_id)
-        with exclusive_lock(path / ".session.lock"):
+        with ExitStack() as locks:
+            if external_event_id and external_event_id.startswith("event-"):
+                locks.enter_context(
+                    exclusive_lock(self.config.storage.root / ".external-event.lock")
+                )
+            locks.enter_context(exclusive_lock(path / ".session.lock"))
             session = read_session(path)
             recovered = self._recover_tail(session_id, path, session)
             if external_event_id:
@@ -147,22 +153,43 @@ class SessionRecorder:
     def _find_external_event(
         self, session_id: str, path: Path, external_event_id: str
     ) -> Message | None:
-        row = self.catalog.message_by_external_event(session_id, external_event_id)
+        deterministic = external_event_id.startswith("event-")
+        row = (
+            self.catalog.message_by_external_event_global(external_event_id)
+            if deterministic
+            else self.catalog.message_by_external_event(session_id, external_event_id)
+        )
         if row is not None:
-            return Message(
-                id=int(row["message_id"]),
-                role=str(row["role"]),
-                text=str(row["content"]),
-                created_at=str(row["created_at"]),
-                metadata={"external_event_id": external_event_id},
-            )
+            return self._message_from_catalog(row, external_event_id)
         # This slow path is used only when transcript fsync succeeded but the
         # recoverable SQLite index update did not, or after catalog loss.
-        for message in read_messages(path / "transcript.jsonl"):
-            if message.metadata.get("external_event_id") == external_event_id:
-                self.catalog.index_message(session_id, message, external_event_id)
-                return message
+        paths = [path]
+        if deterministic:
+            paths = [
+                session_file.parent
+                for session_file in self.config.storage.sessions_dir.glob(
+                    "*/*/*/session.json"
+                )
+            ]
+        for candidate_path in paths:
+            candidate_session_id = candidate_path.name
+            for message in read_messages(candidate_path / "transcript.jsonl"):
+                if message.metadata.get("external_event_id") == external_event_id:
+                    self.catalog.index_message(
+                        candidate_session_id, message, external_event_id
+                    )
+                    return message
         return None
+
+    @staticmethod
+    def _message_from_catalog(row: Any, external_event_id: str) -> Message:
+        return Message(
+            id=int(row["message_id"]),
+            role=str(row["role"]),
+            text=str(row["content"]),
+            created_at=str(row["created_at"]),
+            metadata={"external_event_id": external_event_id},
+        )
 
     def end_session(self, session_id: str, ended_at: str | None = None) -> Session:
         path = self.locate(session_id)

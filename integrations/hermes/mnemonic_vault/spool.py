@@ -59,6 +59,27 @@ class DurableSpool:
         if self._ack_count >= 256:
             self.compact()
 
+    def record_redirect(self, original_session_id: str, recovery_session_id: str) -> None:
+        if self.redirect_for(original_session_id) == recovery_session_id:
+            return
+        self._append_record(
+            {
+                "record": "redirect",
+                "original_session_id": original_session_id,
+                "recovery_session_id": recovery_session_id,
+            }
+        )
+
+    def redirect_for(self, session_id: str) -> str | None:
+        with self._locked():
+            _, redirects = self._scan_unlocked()
+            return redirects.get(session_id)
+
+    def redirects(self) -> dict[str, str]:
+        with self._locked():
+            _, redirects = self._scan_unlocked()
+            return dict(redirects)
+
     def dead_letter(
         self, event: dict[str, Any], reason: str, status: int | None = None
     ) -> None:
@@ -82,17 +103,30 @@ class DurableSpool:
 
     def pending(self) -> list[dict[str, Any]]:
         with self._locked():
-            return list(self._pending_unlocked().values())
+            pending, _ = self._scan_unlocked()
+            return list(pending.values())
 
     def compact(self) -> None:
         with self._locked():
-            pending = self._pending_unlocked()
+            pending, redirects = self._scan_unlocked()
             fd, temporary = tempfile.mkstemp(
                 prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
             )
             temp_path = Path(temporary)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                    for original, recovery in redirects.items():
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "record": "redirect",
+                                    "original_session_id": original,
+                                    "recovery_session_id": recovery,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                     for event in pending.values():
                         stream.write(json.dumps(event, ensure_ascii=False) + "\n")
                     stream.flush()
@@ -114,8 +148,11 @@ class DurableSpool:
                 stream.flush()
                 os.fsync(stream.fileno())
 
-    def _pending_unlocked(self) -> OrderedDict[str, dict[str, Any]]:
+    def _scan_unlocked(
+        self,
+    ) -> tuple[OrderedDict[str, dict[str, Any]], OrderedDict[str, str]]:
         events: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        redirects: OrderedDict[str, str] = OrderedDict()
         lines = self.path.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
             if not line.strip():
@@ -141,6 +178,12 @@ class DurableSpool:
                     },
                 }
                 continue
+            if record.get("record") == "redirect":
+                original = str(record.get("original_session_id", ""))
+                recovery = str(record.get("recovery_session_id", ""))
+                if original and recovery:
+                    redirects[original] = recovery
+                continue
             event_id = str(record.get("event_id", ""))
             if not event_id:
                 continue
@@ -148,7 +191,7 @@ class DurableSpool:
                 events[event_id] = record
             elif record.get("record") == "delivered":
                 events.pop(event_id, None)
-        return events
+        return events, redirects
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
