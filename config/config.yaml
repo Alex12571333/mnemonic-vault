@@ -34,6 +34,7 @@ global_topics:
   minimum_versions: 12
   title_similarity_threshold: 0.50
   lexical_similarity_threshold: 0.72
+  total_token_budget: 3000
 
 api:
   bearer_token_env: "MNEMONIC_VAULT_API_TOKEN"

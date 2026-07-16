@@ -143,19 +143,28 @@ data/global-topics/<global-topic-id>/
 └── sources.json
 ```
 
-`current.md` ссылается на последнюю сессионную версию, `timeline.md` перечисляет
-историю, а `sources.json` хранит все исходные topic IDs. Кластеризация консервативная,
-детерминированная и не вызывает LLM. По умолчанию требуется 12 версий, а rebuild не
-запускается автоматически:
+`current.md` содержит последний сессионный snapshot по `topic.updated_at`, но не
+синтезирует все исторические сведения в единое «текущее состояние». `timeline.md`
+показывает время обновления темы и старта исходной сессии, а `sources.json` хранит
+исходные topic IDs. В проекцию входят только полностью обработанные finalized-сессии.
+Кластеризация использует консервативное complete-link соответствие, детерминирована и
+не вызывает LLM. По умолчанию требуется 12 версий, а rebuild не запускается
+автоматически:
 
 ```bash
 python run.py rebuild-global-topics --dry-run
 python run.py rebuild-global-topics
 ```
 
+После обновления с 0.4.0 существующие производные проекции нужно один раз
+перестроить этой командой. Старый формат до rebuild не участвует в retrieval, а
+совпадающие global IDs сохраняются по исходным topic IDs.
+
 Проекцию можно удалить и полностью восстановить из session topics. Поисковые карточки
 получают `global_topic_id` только после её создания; `memory_open_global_topic`
-открывает ограниченный current/timeline пакет, не заменяя source-level retrieval.
+открывает ограниченный snapshot/timeline пакет, не заменяя source-level retrieval.
+Параметры `max_timeline_entries` и `total_token_budget` ограничивают весь tool output,
+включая current, timeline, sources и метаданные.
 
 ## Фоновые jobs и обслуживание
 
@@ -186,7 +195,7 @@ python run.py rebuild-global-topics
 
 ## Нативные интеграции агентов
 
-Версия 0.4.0 включает два lossless-адаптера:
+Версия 0.4.1 включает два lossless-адаптера:
 
 - OpenClaw memory-slot plugin с lifecycle hooks, семью memory tools и встроенным skill;
 - Hermes Agent `MemoryProvider` с persistent spool, bounded prefetch и теми же tools.

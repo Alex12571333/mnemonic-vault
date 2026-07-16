@@ -101,10 +101,14 @@ export class VaultClient {
   async openGlobalTopic(
     globalTopicId: string,
     maxTimelineEntries = 50,
+    totalTokenBudget?: number,
   ): Promise<Record<string, unknown>> {
     const query = new URLSearchParams({
       max_timeline_entries: String(maxTimelineEntries),
     });
+    if (totalTokenBudget !== undefined) {
+      query.set("total_token_budget", String(totalTokenBudget));
+    }
     return this.request(
       `/v1/memory/global-topics/${encodeURIComponent(globalTopicId)}?${query.toString()}`,
     );

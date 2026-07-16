@@ -343,11 +343,14 @@ export default definePluginEntry({
     api.registerTool({
       name: "memory_open_global_topic",
       label: "Open global memory topic",
-      description: "Open a rebuildable current view, timeline, and source-topic list.",
+      description: "Open a bounded latest-session snapshot, timeline, and source-topic list.",
       parameters: Type.Object({
         global_topic_id: Type.String(),
         max_timeline_entries: Type.Optional(
           Type.Integer({ minimum: 1, maximum: 500 }),
+        ),
+        total_token_budget: Type.Optional(
+          Type.Integer({ minimum: 300, maximum: 32_000 }),
         ),
       }),
       async execute(_id, rawParams) {
@@ -357,6 +360,7 @@ export default definePluginEntry({
             await client.openGlobalTopic(
               params.global_topic_id,
               params.max_timeline_entries,
+              params.total_token_budget,
             ),
           );
         } catch (error) {

@@ -134,7 +134,7 @@ def create_app(
 
     app = FastAPI(
         title="Mnemonic Vault",
-        version="0.4.0",
+        version="0.4.1",
         lifespan=lifespan,
     )
     app.state.services = services
@@ -245,8 +245,11 @@ def create_app(
     def open_global_topic(
         global_topic_id: str,
         max_timeline_entries: int = Query(default=50, ge=1, le=500),
+        total_token_budget: int | None = Query(default=None, ge=300, le=32000),
     ) -> dict[str, Any]:
-        return global_topics.get(global_topic_id, max_timeline_entries)
+        return global_topics.get(
+            global_topic_id, max_timeline_entries, total_token_budget
+        )
 
     @app.get("/v1/memory/topics/{topic_id}")
     def open_topic(topic_id: str) -> dict[str, Any]:

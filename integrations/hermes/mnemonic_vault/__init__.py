@@ -313,6 +313,11 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                     "minimum": 1,
                     "maximum": 500,
                 },
+                "total_token_budget": {
+                    "type": "integer",
+                    "minimum": 300,
+                    "maximum": 32000,
+                },
             },
             "required": ["global_topic_id"],
             "additionalProperties": False,
@@ -349,7 +354,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             _tool("memory_open_topic", "Open one topic and its complete summary.", topic),
             _tool(
                 "memory_open_global_topic",
-                "Open a rebuildable current view, timeline, and source-topic list.",
+                "Open a bounded latest-session snapshot, timeline, and source-topic list.",
                 global_topic,
             ),
             _tool(
@@ -419,6 +424,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                 value = self._client.open_global_topic(
                     args["global_topic_id"],
                     max_timeline_entries=args.get("max_timeline_entries", 50),
+                    total_token_budget=args.get("total_token_budget"),
                 )
             elif tool_name == "memory_expand_topic":
                 value = self._client.expand_topic(

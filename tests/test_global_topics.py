@@ -17,7 +17,14 @@ from app.models import SourceRange, Topic
 from app.recorder import SessionRecorder
 from app.retriever import ContextBuilder, Retriever
 from app.service import Services
-from app.storage import write_topic
+from app.storage import (
+    atomic_write_json,
+    estimate_tokens,
+    read_json,
+    read_session,
+    write_session,
+    write_topic,
+)
 from app.summarizer import JobRunner, MemorySummarizer
 
 
@@ -62,6 +69,8 @@ class GlobalTopicProjectionTest(unittest.TestCase):
         description: str | None = None,
         problem: str = "Stable fast inference on DGX Spark",
         keywords: list[str] | None = None,
+        updated_at: str | None = None,
+        finalized: bool = True,
     ) -> tuple[Topic, Path]:
         session_id = f"session-dflash-{year}"
         session = self.recorder.start_session(
@@ -72,18 +81,29 @@ class GlobalTopicProjectionTest(unittest.TestCase):
             id=f"topic-dflash-{year}",
             session_id=session.id,
             title=title,
-            description=description or f"DFlash inference configuration in {year}",
+            description=(
+                f"DFlash inference configuration in {year}"
+                if description is None
+                else description
+            ),
             problem=problem,
             status="active",
             keywords=keywords or ["DFlash", "DGX Spark", "vLLM"],
             source_ranges=[SourceRange(session.id, 1, 1)],
             created_at=f"{year}-01-10T10:05:00+09:00",
-            updated_at=f"{year}-01-10T10:05:00+09:00",
+            updated_at=updated_at or f"{year}-01-10T10:05:00+09:00",
             summary=summary,
         )
         path = self.recorder.locate(session.id) / "topics" / f"{topic.id}.md"
         write_topic(path, topic)
         self.indexer.index_topic(path, with_embedding=False)
+        if finalized:
+            session = read_session(self.recorder.locate(session.id))
+            session.processed_until_message = session.message_count
+            session.status = "finalized"
+            session.ended_at = f"{year}-01-10T10:10:00+09:00"
+            write_session(self.recorder.locate(session.id), session)
+            self.catalog.upsert_session(session, self.recorder.locate(session.id))
         return topic, path
 
     def _services(self) -> Services:
@@ -129,14 +149,31 @@ class GlobalTopicProjectionTest(unittest.TestCase):
         self.assertIn("Qwen is the current model", opened["current"])
         self.assertIn("2026-01-10", opened["timeline"])
         self.assertIn("2027-01-10", opened["timeline"])
+        self.assertIn("session started", opened["timeline"])
+        self.assertIn("latest-session-snapshot", opened["current"])
+        self.assertIn("не синтез всех", opened["current"])
         self.assertEqual(opened["sources"]["topic_ids"], [old.id, current.id])
         self.assertEqual(old_path.read_bytes(), original_bytes[old.id])
         self.assertEqual(current_path.read_bytes(), original_bytes[current.id])
+
+        stale_index = read_json(store.index_path)
+        stale_index["version"] = 1
+        atomic_write_json(store.index_path, stale_index)
+        self.assertEqual(store.list(), [])
+        migration_preview = store.rebuild(dry_run=True)
+        self.assertEqual(migration_preview["topics"][0]["id"], global_id)
+        store.rebuild()
 
         bounded = store.get(global_id, max_timeline_entries=1)
         self.assertEqual(bounded["topic_ids"], [current.id])
         self.assertEqual(bounded["older_topic_ids_omitted"], 1)
         self.assertNotIn(old.id, bounded["timeline"])
+
+        token_bounded = store.get(global_id, total_token_budget=300)
+        serialized = json.dumps(token_bounded, ensure_ascii=False)
+        self.assertLessEqual(estimate_tokens(serialized), 300)
+        self.assertLessEqual(token_bounded["used_tokens"], 300)
+        self.assertTrue(token_bounded["truncated_to_token_budget"])
 
         previous = store.root.parent / ".global-topics.previous"
         store.root.replace(previous)
@@ -174,6 +211,73 @@ class GlobalTopicProjectionTest(unittest.TestCase):
         opened = client.get(f"/v1/memory/global-topics/{first_id}")
         self.assertEqual(opened.status_code, 200)
         self.assertEqual(opened.json()["sources"]["current_topic_id"], latest.id)
+
+        bounded_api = client.get(
+            f"/v1/memory/global-topics/{first_id}",
+            params={"total_token_budget": 300},
+        )
+        self.assertEqual(bounded_api.status_code, 200)
+        self.assertLessEqual(bounded_api.json()["used_tokens"], 300)
+
+    def test_latest_snapshot_uses_topic_update_and_ignores_active_sessions(self):
+        updated_late, _ = self._topic(
+            2026,
+            "## Итог\nJanuary session was updated in December 2028.",
+            updated_at="2028-12-20T18:00:00+09:00",
+        )
+        self._topic(
+            2027,
+            "## Итог\nNewer session started later but was updated earlier.",
+            updated_at="2027-07-01T12:00:00+09:00",
+        )
+        self._topic(
+            2029,
+            "## Итог\nIncomplete active session must not become current.",
+            updated_at="2029-01-01T12:00:00+09:00",
+            finalized=False,
+        )
+
+        store = GlobalTopicStore(self.config)
+        report = store.rebuild()
+        self.assertEqual(report["scanned_topics"], 2)
+        opened = store.get(report["topics"][0]["id"])
+        self.assertEqual(opened["current_topic_id"], updated_late.id)
+        self.assertIn("2028-12-20T18:00:00+09:00", opened["timeline"])
+        self.assertIn("2026-01-10T10:00:00+09:00", opened["timeline"])
+        self.assertNotIn("topic-dflash-2029", opened["sources"]["topic_ids"])
+
+    def test_complete_link_clustering_blocks_similarity_chain_drift(self):
+        self._topic(
+            2026,
+            "A",
+            title="Infrastructure",
+            description="",
+            problem="",
+            keywords=["alpha", "beta"],
+        )
+        self._topic(
+            2027,
+            "B",
+            title="Infrastructure",
+            description="",
+            problem="",
+            keywords=["alpha", "beta", "gamma", "delta"],
+        )
+        self._topic(
+            2028,
+            "C",
+            title="Infrastructure",
+            description="",
+            problem="",
+            keywords=["gamma", "delta"],
+        )
+        store = GlobalTopicStore(self.config)
+        sources = {source["topic"].id: source for source in store._scan_sources()}
+        self.assertTrue(store._matches(sources["topic-dflash-2026"], sources["topic-dflash-2027"]))
+        self.assertTrue(store._matches(sources["topic-dflash-2027"], sources["topic-dflash-2028"]))
+        self.assertFalse(store._matches(sources["topic-dflash-2026"], sources["topic-dflash-2028"]))
+        report = store.rebuild(minimum_versions=3, dry_run=True)
+        self.assertEqual(report["projected_topics"], 0)
 
     def test_same_generic_title_does_not_merge_unrelated_cards(self):
         self._topic(
