@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
+import unittest
 from pathlib import Path
+
+if (
+    importlib.util.find_spec("agent_core") is None
+    or importlib.util.find_spec("agent_sdk") is None
+):
+    raise unittest.SkipTest(
+        "Corax integration tests require optional agent-core and agent-sdk packages"
+    )
 
 from agent_core import MemoryProvider, MemoryQuery, MemoryRecord, ResultStatus
 from agent_sdk import ExtensionManifest, load_extension_instance
