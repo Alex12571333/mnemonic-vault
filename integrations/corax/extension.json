@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "id": "memory.mnemonic-vault",
+  "kind": "memory_provider",
+  "name": "Mnemonic Vault",
+  "description": "File-first long-term memory with bounded scoped recall.",
+  "version": "0.6.0",
+  "author": "Mnemonic Vault",
+  "license": "MIT",
+  "homepage": "https://github.com/Alex12571333/mnemonic-vault",
+  "tags": ["file-first", "memory", "mnemonic-vault"],
+  "interfaces": ["agent.memory/v1"],
+  "exposure": "runtime",
+  "entrypoint": "provider:MnemonicVaultProvider",
+  "dependencies": [],
+  "security": {
+    "permission_level": "confirm",
+    "required_scopes": ["memory.read", "memory.write", "network.outbound"],
+    "risk_level": "medium",
+    "side_effects": ["network_request", "memory_write"],
+    "secrets": ["MNEMONIC_VAULT_API_TOKEN"]
+  },
+  "schemas": {
+    "config": {
+      "type": "object",
+      "properties": {
+        "base_url": {"type": "string"}
+      }
+    },
+    "input": {},
+    "output": {}
+  },
+  "compatibility": {
+    "min_core_version": "0.2.0",
+    "sdk_version": "0.2.0"
+  }
+}

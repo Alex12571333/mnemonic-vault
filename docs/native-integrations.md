@@ -18,6 +18,10 @@ network errors and server failures remain pending for retry.
 
 ## Shared memory workflow
 
+Corax is integrated through `integrations/corax` as a typed
+`memory_provider`. Unlike the optional explicit memory tools below, the provider
+is a runtime port and is never advertised in the model's tool list.
+
 The integrations expose:
 
 - `memory_search(query)` — hybrid topic search with a summary budget;

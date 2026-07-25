@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add a typed Corax `memory_provider` adapter with explicit-write authorization.
+
 ## 0.5.1 — 2026-07-16
 
 - Keep every agent, project, and session scope in one shared retrieval space;
