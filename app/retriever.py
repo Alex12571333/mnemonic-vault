@@ -621,6 +621,7 @@ class ContextBuilder:
             reverse=True,
         )
         return {
+            "inventory_complete": False,
             "results": unified_results,
             "explicit_memories": explicit_output,
             "topics": output,

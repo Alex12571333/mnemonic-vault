@@ -385,6 +385,7 @@ class HardeningTest(unittest.TestCase):
         result = ContextBuilder(self.config, retriever).build(
             "DFlash", include_sources="always"
         )
+        self.assertIs(result["inventory_complete"], False)
         self.assertLessEqual(result["used_tokens"], result["budget_tokens"])
         self.assertEqual(
             sum(result["budget_breakdown"].values()), result["used_tokens"]

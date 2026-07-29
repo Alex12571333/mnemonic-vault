@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mark memory search as a bounded relevance-ranked subset so agents do not
+  mistake one match for the complete Vault inventory.
 - Expose the existing eight Mnemonic Vault operations to Corax as
   provider-owned tools, with read results marked as untrusted historical data
   and writes kept behind Corax policy.

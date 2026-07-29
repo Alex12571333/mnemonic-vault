@@ -272,6 +272,7 @@ class IntegrationHelpersTests(unittest.TestCase):
         })
         self.assertIn("Explicit memory: mem-a", context)
         self.assertIn("project:vault", context)
+        self.assertIn("not a complete inventory", context)
 
 
 if __name__ == "__main__":
