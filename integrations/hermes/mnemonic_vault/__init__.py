@@ -370,7 +370,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         return [
             _tool(
                 "memory_search",
-                "Search the shared Vault. Scopes boost by default; use strict only for an explicitly requested scope.",
+                "Search a bounded relevance-ranked subset of the shared Vault, not its complete inventory. Scopes boost by default; use strict only for an explicitly requested scope.",
                 {
                     "type": "object",
                     "properties": {

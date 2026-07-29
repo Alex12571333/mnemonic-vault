@@ -10,7 +10,11 @@ from typing import Any
 from unittest import mock
 
 from integrations.hermes.mnemonic_vault import MnemonicVaultMemoryProvider
-from integrations.hermes.mnemonic_vault.client import format_memory_context, vault_session_id
+from integrations.hermes.mnemonic_vault.client import (
+    VaultClient,
+    format_memory_context,
+    vault_session_id,
+)
 
 
 class FakeVaultClient:
@@ -70,6 +74,12 @@ class FakeVaultClient:
 
 
 class HermesProviderTests(unittest.TestCase):
+    def test_search_marks_legacy_server_response_as_incomplete_inventory(self):
+        client = VaultClient("http://vault.test")
+        with mock.patch.object(client, "_request", return_value={"topics": []}):
+            result = client.search("everything")
+        self.assertIs(result["inventory_complete"], False)
+
     def test_turn_capture_is_non_blocking_and_ordered(self):
         client = FakeVaultClient()
         with tempfile.TemporaryDirectory() as temporary:

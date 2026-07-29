@@ -80,7 +80,7 @@ class VaultClient:
         scope_mode: str = "boost",
         include_all_scopes: bool = False,
     ) -> dict[str, Any]:
-        return self._request(
+        result = self._request(
             "/v1/memory/search",
             method="POST",
             payload={
@@ -103,6 +103,8 @@ class VaultClient:
                 ),
             },
         )
+        result.setdefault("inventory_complete", False)
+        return result
 
     def remember(
         self,
