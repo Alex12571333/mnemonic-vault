@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -15,11 +16,14 @@ if (
     )
 
 from agent_core import (
+    CapabilityRequest,
     ExtensionRequest,
     MemoryProvider,
     MemoryQuery,
     MemoryRecord,
+    PermissionLevel,
     ResultStatus,
+    SideEffect,
 )
 from agent_sdk import ExtensionManifest, load_extension_instance
 
@@ -51,6 +55,7 @@ class FakeNativeLoop:
     def __init__(self) -> None:
         self.initialized: list[tuple[str, str]] = []
         self.synced: list[tuple[str, str, str, str]] = []
+        self.tool_calls: list[tuple[str, dict]] = []
         self.stopped = False
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -72,6 +77,32 @@ class FakeNativeLoop:
 
     def shutdown(self) -> None:
         self.stopped = True
+
+    def get_tool_schemas(self) -> list[dict]:
+        return [
+            {
+                "name": "memory_search",
+                "description": "Search memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "memory_remember",
+                "description": "Remember an explicit user request.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"verbatim": {"type": "string"}},
+                    "required": ["verbatim"],
+                },
+            },
+        ]
+
+    def handle_tool_call(self, name: str, args: dict) -> str:
+        self.tool_calls.append((name, args))
+        return json.dumps({"tool": name, "args": args})
 
 
 def test_manifest_loads_memory_contract() -> None:
@@ -185,6 +216,35 @@ def test_native_loop_keeps_explicit_memory_compatible() -> None:
     assert result.payload["captured"] is True
     assert client.remembered[0]["kind"] == "fact"
     assert client.remembered[0]["scope"] == {"type": "global"}
+
+
+def test_corax_exposes_native_memory_tools_through_policy_proxies() -> None:
+    native = FakeNativeLoop()
+    provider = MnemonicVaultProvider(client=FakeClient(), native_loop=native)
+    proxies = {proxy.id: proxy for proxy in provider.tool_proxies()}
+
+    search = proxies["memory_search"]
+    result = asyncio.run(
+        search.execute(
+            CapabilityRequest(
+                task_id="task-1",
+                session_id="chat-1",
+                input={"query": "что сохранено"},
+            )
+        )
+    )
+
+    assert result.status is ResultStatus.SUCCESS
+    assert result.payload["trust"] == "untrusted_historical_reference"
+    assert result.payload["result"]["tool"] == "memory_search"
+    assert search.routing["always_available"] is True
+    assert search.permission_level is PermissionLevel.SAFE
+    assert search.side_effects == {SideEffect.NONE}
+    assert proxies["memory_remember"].permission_level is PermissionLevel.CONFIRM
+    assert proxies["memory_remember"].side_effects == {SideEffect.MEMORY_WRITE}
+    assert native.tool_calls == [
+        ("memory_search", {"query": "что сохранено"})
+    ]
 
 
 def test_correction_turn_is_captured_without_explicit_memory() -> None:

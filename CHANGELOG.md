@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Expose the existing eight Mnemonic Vault operations to Corax as
+  provider-owned tools, with read results marked as untrusted historical data
+  and writes kept behind Corax policy.
 - Upgrade the typed Corax adapter to a provider-owned native memory loop with
   bounded recall, lossless user/assistant turn capture, durable replay, and
   stable turn-level idempotency.

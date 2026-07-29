@@ -1,9 +1,8 @@
 # Native Corax, OpenClaw, and Hermes integrations
 
-Mnemonic Vault ships three native adapters. All use the same loopback HTTP API,
-automatically record completed turns, and inject only a bounded amount of
-retrieved history. OpenClaw and Hermes expose the same eight memory tools;
-Corax keeps memory runtime-only and provides `/memory` commands instead.
+Mnemonic Vault ships three native adapters. All use the same HTTP API,
+automatically record completed turns, inject only a bounded amount of retrieved
+history, and expose the same eight memory tools.
 Retrieval stays non-generative; the Memory LLM continues to run only in the
 background summarizer.
 
@@ -24,7 +23,8 @@ Corax is integrated through `integrations/corax` as a typed
 provider-owned loop automatically, so its generic `memory.loop` stays loaded for
 other providers but is neither bound nor called for Mnemonic Vault. The native
 loop captures both sides of every completed turn, replays its durable spool, and
-injects bounded recall. It is never advertised in the model's tool list.
+injects bounded recall. Its tools enter the same Corax routing, policy, tracing,
+and UI path as every other model-callable capability.
 
 Corax stores its spool below
 `$CORAX_DATA_PATH/mnemonic-vault/spool/corax.jsonl`, which remains stable across

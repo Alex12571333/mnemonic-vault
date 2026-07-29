@@ -4,7 +4,7 @@
   "kind": "memory_provider",
   "name": "Mnemonic Vault",
   "description": "File-first long-term memory with bounded recall and lossless native turn capture.",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "author": "Mnemonic Vault",
   "license": "MIT",
   "homepage": "https://github.com/Alex12571333/mnemonic-vault",

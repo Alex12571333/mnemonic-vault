@@ -3,7 +3,8 @@
 This package implements both `agent.memory/v1` and `agent.memoryloop/v1`.
 Corax therefore uses the provider's native bounded recall and lossless turn
 capture instead of its generic memory loop. Other memory providers continue to
-use the generic loop. Neither interface is exposed to the model as a tool.
+use the generic loop. The provider also exposes the same eight memory tools as
+OpenClaw and Hermes through Corax's normal routing, policy, tracing, and UI path.
 
 Set `MNEMONIC_VAULT_URL` and `MNEMONIC_VAULT_API_TOKEN`, configure the
 extension path as `../mnemonic-vault/integrations/corax`, and bind
