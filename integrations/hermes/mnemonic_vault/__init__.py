@@ -51,7 +51,18 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         self,
         client: VaultClient | None = None,
         spool_path: str | Path | None = None,
+        *,
+        agent: str = "hermes",
     ):
+        self._agent = (
+            "".join(
+                character.lower()
+                if character.isalnum() or character in "_-"
+                else "-"
+                for character in agent.strip()
+            )
+            or "hermes"
+        )
         self._base_url = os.getenv(
             "MNEMONIC_VAULT_URL", "http://127.0.0.1:8765"
         ).rstrip("/")
@@ -73,8 +84,10 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
             "MNEMONIC_VAULT_SUMMARY_BUDGET_TOKENS", 1500
         )
         self._agent_instance_id = (
-            os.getenv("MNEMONIC_VAULT_AGENT_INSTANCE_ID", "hermes-main").strip()
-            or "hermes-main"
+            os.getenv(
+                "MNEMONIC_VAULT_AGENT_INSTANCE_ID", f"{self._agent}-main"
+            ).strip()
+            or f"{self._agent}-main"
         )
         self._project_id = os.getenv("MNEMONIC_VAULT_PROJECT_ID", "").strip()
         self._session_id = ""
@@ -92,12 +105,20 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                 str(fallback_root),
             )
         )
-        default_spool = project_root / "data" / "spool" / "hermes.jsonl"
+        default_spool = project_root / "data" / "spool" / f"{self._agent}.jsonl"
         spool_dir = os.getenv("MNEMONIC_VAULT_SPOOL_DIR", "")
+        if not spool_dir and self._agent == "corax":
+            corax_data = os.getenv("CORAX_DATA_PATH", "").strip()
+            if corax_data:
+                spool_dir = str(Path(corax_data) / "mnemonic-vault" / "spool")
         resolved_spool = (
             Path(spool_path)
             if spool_path
-            else (Path(spool_dir) / "hermes.jsonl" if spool_dir else default_spool)
+            else (
+                Path(spool_dir) / f"{self._agent}.jsonl"
+                if spool_dir
+                else default_spool
+            )
         )
         self._spool = DurableSpool(resolved_spool)
         self._worker: threading.Thread | None = None
@@ -109,6 +130,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         self._prefetch_futures: dict[str, Future[str]] = {}
         self._prefetch_cache: dict[str, str] = {}
         self._lock = threading.Lock()
+        self._closed = False
 
     @property
     def name(self) -> str:
@@ -119,6 +141,17 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         return self._base_url.startswith(("http://", "https://"))
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
+        if self._closed:
+            self._stop_worker.clear()
+            self._wake_worker.clear()
+            self._worker = None
+            self._prefetch_pool = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="mnemonic-vault-prefetch"
+            )
+            with self._lock:
+                self._prefetch_futures.clear()
+                self._prefetch_cache.clear()
+            self._closed = False
         self._session_id = session_id or "main"
         self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
         if self._write_enabled and self._auto_capture:
@@ -185,19 +218,21 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
+        run_id: str = "",
         messages: list[dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> bool:
         """Durably spool a completed turn and return immediately."""
         if not self._write_enabled or not self._auto_capture:
-            return
+            return False
         external_id = session_id or self._session_id or "main"
         vault_id = self._vault_session(external_id)
         metadata = {
-            "source": "hermes-memory-provider",
+            "source": f"{self._agent}-memory-provider",
             "external_session_id": external_id,
             "agent_instance_id": self._agent_instance_id,
         }
         message_sequence = len(messages) if messages is not None else None
+        appended = False
         if user_content:
             self._spool.append(
                 {
@@ -205,19 +240,20 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                         self._agent_instance_id,
                         external_id,
                         "user",
-                        None,
+                        run_id,
                         message_sequence,
                         user_content,
                     ),
                     "kind": "message",
                     "session_id": vault_id,
                     "external_session_id": external_id,
-                    "agent": "hermes",
+                    "agent": self._agent,
                     "role": "user",
                     "content": user_content,
                     "metadata": metadata,
                 }
             )
+            appended = True
         if assistant_content:
             self._spool.append(
                 {
@@ -225,20 +261,23 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                         self._agent_instance_id,
                         external_id,
                         "assistant",
-                        None,
+                        run_id,
                         message_sequence,
                         assistant_content,
                     ),
                     "kind": "message",
                     "session_id": vault_id,
                     "external_session_id": external_id,
-                    "agent": "hermes",
+                    "agent": self._agent,
                     "role": "assistant",
                     "content": assistant_content,
                     "metadata": metadata,
                 }
             )
-        self._wake_worker.set()
+            appended = True
+        if appended:
+            self._wake_worker.set()
+        return appended
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if self._write_enabled and self._auto_capture:
@@ -256,7 +295,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                     "kind": "end",
                     "session_id": self._vault_session(external_id),
                     "external_session_id": external_id,
-                    "agent": "hermes",
+                    "agent": self._agent,
                 }
             )
             self._wake_worker.set()
@@ -288,17 +327,20 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
                     "kind": "end",
                     "session_id": self._vault_session(old_session),
                     "external_session_id": old_session,
-                    "agent": "hermes",
+                    "agent": self._agent,
                 }
             )
         self._wake_worker.set()
 
     def shutdown(self) -> None:
+        if self._closed:
+            return
         if self._worker and self._worker.is_alive():
             self._stop_worker.set()
             self._wake_worker.set()
             self._worker.join(timeout=10.0)
-        self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
+        self._prefetch_pool.shutdown(wait=True, cancel_futures=True)
+        self._closed = True
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         topic = {
@@ -659,7 +701,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
     def _deliver(self, event: dict[str, Any]) -> None:
         vault_id = str(event["session_id"]).strip()
         external_id = str(event["external_session_id"]).strip()
-        agent = str(event.get("agent", "hermes")).strip()
+        agent = str(event.get("agent", self._agent)).strip()
         if not vault_id or not external_id or not agent:
             raise ValueError("missing session or agent identity")
         target_id = self._spool.redirect_for(vault_id) or vault_id
@@ -719,7 +761,7 @@ class MnemonicVaultMemoryProvider(MemoryProvider):
         if existing:
             return existing
         vault_id = vault_session_id(
-            external_id, "hermes", self._agent_instance_id
+            external_id, self._agent, self._agent_instance_id
         )
         self._vault_sessions[external_id] = vault_id
         return vault_id

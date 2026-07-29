@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- Add a typed Corax `memory_provider` adapter with explicit-write authorization.
+- Upgrade the typed Corax adapter to a provider-owned native memory loop with
+  bounded recall, lossless user/assistant turn capture, durable replay, and
+  stable turn-level idempotency.
+- Keep Corax delivery spools under the host's persistent data directory so
+  side-by-side agent upgrades cannot strand pending events.
 
 ## 0.5.1 — 2026-07-16
 

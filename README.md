@@ -167,9 +167,9 @@ Scope — метка релевантности, а не граница дост
 текущий agent `+0.08`, global `+0.05`. Другие project/agent записи остаются
 обычными кандидатами; чужая session получает сильное понижение, но не скрывается.
 
-Автоматический recall OpenClaw и Hermes передаёт свои стабильные agent/session
-scope. Необязательный project задаётся через OpenClaw `projectId` или Hermes
-`MNEMONIC_VAULT_PROJECT_ID`.
+Автоматический recall Corax, OpenClaw и Hermes передаёт свои стабильные
+agent/session scope. Необязательный project задаётся через
+`MNEMONIC_VAULT_PROJECT_ID` или конфигурацию адаптера.
 
 ```json
 {
@@ -196,9 +196,10 @@ scope. Необязательный project задаётся через OpenClaw
 
 ## Надёжная доставка
 
-OpenClaw и Hermes сначала делают `fsync` события в переносимый spool:
+Corax, OpenClaw и Hermes сначала делают `fsync` события в переносимый spool:
 
 ```text
+<corax-data>/mnemonic-vault/spool/corax.jsonl
 data/spool/openclaw.jsonl
 data/spool/openclaw.dead-letter.jsonl
 data/spool/hermes.jsonl
@@ -293,14 +294,16 @@ python run.py rebuild-global-topics
 
 ## Нативные интеграции агентов
 
-Версия 0.5.1 включает два lossless-адаптера:
+В проект входят три lossless-адаптера:
 
+- Corax `memory_provider` с собственным `agent.memoryloop/v1`, persistent spool
+  и автоматическим выбором вместо generic memory loop;
 - OpenClaw memory-slot plugin с lifecycle hooks, восемью memory tools,
   гарантированной `/remember` command и встроенным skill;
 - Hermes Agent `MemoryProvider` с persistent spool, bounded prefetch и теми же
   восемью tools, включая `memory_remember`.
 
-Оба адаптера автоматически сохраняют ходы, подмешивают только небольшой релевантный
+Все адаптеры автоматически сохраняют ходы, подмешивают только небольшой релевантный
 контекст и позволяют раскрывать исходные transcript ranges для точных значений.
 Установка и проверка описаны в [документации интеграций](docs/native-integrations.md).
 

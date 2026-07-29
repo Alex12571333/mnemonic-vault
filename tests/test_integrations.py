@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from integrations.hermes.mnemonic_vault import MnemonicVaultMemoryProvider
 from integrations.hermes.mnemonic_vault.client import format_memory_context, vault_session_id
@@ -169,6 +171,76 @@ class HermesProviderTests(unittest.TestCase):
         self.assertEqual(manifest["kind"], "memory")
         self.assertEqual(manifest["version"], "0.5.1")
         self.assertEqual(len(manifest["contracts"]["tools"]), 8)
+
+
+class CoraxNativeLoopTests(unittest.TestCase):
+    def test_corax_spool_uses_stable_runtime_data(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ,
+            {
+                "CORAX_DATA_PATH": temporary,
+                "MNEMONIC_VAULT_SPOOL_DIR": "",
+            },
+        ):
+            provider = MnemonicVaultMemoryProvider(
+                client=FakeVaultClient(),
+                agent="corax",
+            )
+            self.assertEqual(
+                Path(provider.backup_paths()[0]),
+                Path(temporary) / "mnemonic-vault/spool/corax.jsonl",
+            )
+            provider.shutdown()
+
+    def test_corax_turn_ids_are_lossless_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = MnemonicVaultMemoryProvider(
+                client=FakeVaultClient(),
+                spool_path=Path(temporary) / "corax.jsonl",
+                agent="corax",
+            )
+            for turn_id in ("turn-1", "turn-2", "turn-1"):
+                self.assertTrue(provider.sync_turn(
+                    "same text",
+                    "same answer",
+                    session_id="chat-1",
+                    run_id=turn_id,
+                ))
+            pending = provider._spool.pending()
+            provider.shutdown()
+
+        self.assertEqual(len(pending), 4)
+        self.assertEqual({event["agent"] for event in pending}, {"corax"})
+        self.assertEqual(
+            {event["metadata"]["source"] for event in pending},
+            {"corax-memory-provider"},
+        )
+        self.assertTrue(all(
+            event["session_id"].startswith("session-corax-")
+            for event in pending
+        ))
+
+    def test_native_loop_restarts_after_shutdown(self):
+        client = FakeVaultClient()
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = MnemonicVaultMemoryProvider(
+                client=client,
+                spool_path=Path(temporary) / "corax.jsonl",
+                agent="corax",
+            )
+            provider.initialize("chat-1", agent_context="primary")
+            provider.shutdown()
+            provider.initialize("chat-2", agent_context="primary")
+            self.assertTrue(provider.sync_turn("again", "", run_id="turn-2"))
+            deadline = time.monotonic() + 2
+            while provider._spool.pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            provider.shutdown()
+
+        self.assertTrue(any(
+            call[0] == "append" and call[3] == "again"
+            for call in client.calls
+        ))
 
 
 class IntegrationHelpersTests(unittest.TestCase):

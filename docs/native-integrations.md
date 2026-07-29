@@ -1,13 +1,14 @@
-# Native OpenClaw and Hermes integrations
+# Native Corax, OpenClaw, and Hermes integrations
 
-Mnemonic Vault 0.5.1 ships two native adapters. Both use the same loopback HTTP
-API, expose the same eight memory tools, automatically record completed turns, and
-inject only a bounded amount of retrieved history. Retrieval stays
-non-generative; the Memory LLM continues to run only in the background
-summarizer.
+Mnemonic Vault ships three native adapters. All use the same loopback HTTP API,
+automatically record completed turns, and inject only a bounded amount of
+retrieved history. OpenClaw and Hermes expose the same eight memory tools;
+Corax keeps memory runtime-only and provides `/memory` commands instead.
+Retrieval stays non-generative; the Memory LLM continues to run only in the
+background summarizer.
 
-Before either adapter contacts the API, captured events are appended and
-`fsync`ed to `data/spool/openclaw.jsonl` or `data/spool/hermes.jsonl`. Successful
+Before an adapter contacts the API, captured events are appended and
+`fsync`ed to its durable spool. Successful
 delivery appends a durable acknowledgement. Pending events are replayed in order
 after an agent or Vault restart. Event IDs are derived from the persistent agent
 identity, external chat, role, and stable run/message-sequence identity, so replaying
@@ -19,8 +20,16 @@ network errors and server failures remain pending for retry.
 ## Shared memory workflow
 
 Corax is integrated through `integrations/corax` as a typed
-`memory_provider`. Unlike the optional explicit memory tools below, the provider
-is a runtime port and is never advertised in the model's tool list.
+`memory_provider` that also implements `agent.memoryloop/v1`. Corax selects that
+provider-owned loop automatically, so its generic `memory.loop` stays loaded for
+other providers but is neither bound nor called for Mnemonic Vault. The native
+loop captures both sides of every completed turn, replays its durable spool, and
+injects bounded recall. It is never advertised in the model's tool list.
+
+Corax stores its spool below
+`$CORAX_DATA_PATH/mnemonic-vault/spool/corax.jsonl`, which remains stable across
+side-by-side runtime upgrades. `/memory remember …` creates immediate explicit
+memory; ordinary text is captured losslessly for background processing.
 
 The integrations expose:
 
@@ -115,10 +124,10 @@ Recall is prefetched in a small thread pool with a bounded timeout.
 | `MNEMONIC_VAULT_AUTO_RECALL` | `true` |
 | `MNEMONIC_VAULT_MAX_TOPICS` | `5` |
 | `MNEMONIC_VAULT_SUMMARY_BUDGET_TOKENS` | `1500` |
-| `MNEMONIC_VAULT_AGENT_INSTANCE_ID` | `hermes-main` |
+| `MNEMONIC_VAULT_AGENT_INSTANCE_ID` | `hermes-main` (`corax-main` in Corax) |
 | `MNEMONIC_VAULT_API_TOKEN` | empty on loopback |
 | `MNEMONIC_VAULT_PROJECT_ROOT` | source tree or `~/mnemonic-vault` |
-| `MNEMONIC_VAULT_SPOOL_DIR` | `<project>/data/spool` |
+| `MNEMONIC_VAULT_SPOOL_DIR` | `<project>/data/spool` (Corax uses its persistent data directory) |
 
 `MNEMONIC_VAULT_AGENT_INSTANCE_ID` must stay unchanged across process restarts.
 Use a distinct stable value for each independent Hermes installation. Upgrading

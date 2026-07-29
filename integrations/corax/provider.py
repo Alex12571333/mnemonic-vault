@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -12,6 +15,7 @@ from urllib.request import Request, urlopen
 from agent_core import (
     CoreError,
     ErrorCode,
+    ExtensionRequest,
     HealthStatus,
     MemoryProvider,
     MemoryQuery,
@@ -21,6 +25,15 @@ from agent_core import (
     RiskLevel,
 )
 from agent_sdk import memory_provider
+
+_HERMES_ROOT = Path(__file__).resolve().parents[1] / "hermes"
+sys.path.insert(0, str(_HERMES_ROOT))
+try:
+    from mnemonic_vault import MnemonicVaultMemoryProvider as _NativeMemoryLoop
+finally:
+    sys.path.remove(str(_HERMES_ROOT))
+
+_VALID_SCOPE_TYPES = {"global", "agent", "project", "session"}
 
 
 class _Client(Protocol):
@@ -84,9 +97,13 @@ class _HttpClient:
 @memory_provider(
     id="memory.mnemonic-vault",
     name="Mnemonic Vault",
-    description="File-first long-term memory with bounded scoped recall.",
-    version="0.6.0",
+    description=(
+        "File-first long-term memory with bounded recall and lossless native "
+        "turn capture."
+    ),
+    version="0.7.0",
     tags=("memory", "file-first", "mnemonic-vault"),
+    interfaces=("agent.memory/v1", "agent.memoryloop/v1"),
     permission_level=PermissionLevel.CONFIRM,
     required_scopes=("memory.read", "memory.write", "network.outbound"),
     risk_level=RiskLevel.MEDIUM,
@@ -102,12 +119,127 @@ class _HttpClient:
     min_core_version="0.2.0",
 )
 class MnemonicVaultProvider(MemoryProvider):
-    """Map the Corax memory contract to Vault search and explicit remember."""
+    """Map Corax memory and turn lifecycle contracts to Mnemonic Vault."""
 
-    def __init__(self, *, client: _Client | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: _Client | None = None,
+        native_loop: Any | None = None,
+    ) -> None:
         self._client = client or _HttpClient(
             os.getenv("MNEMONIC_VAULT_URL", "http://127.0.0.1:8765"),
             os.getenv("MNEMONIC_VAULT_API_TOKEN", ""),
+        )
+        self._native_loop = native_loop
+
+    async def handle(self, request: ExtensionRequest) -> Result:
+        operation = request.operation.strip().lower()
+        if operation in {"before_turn", "recall"}:
+            text = str(request.payload.get("text", ""))
+            if not text.strip():
+                return Result.ok(
+                    {"context": "", "records": [], "provider": self.id},
+                    session_id=request.session_id,
+                )
+            try:
+                loop = self._turn_loop(request.session_id)
+                context = await asyncio.to_thread(
+                    loop.prefetch,
+                    text,
+                    session_id=request.session_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _failure(str(exc), session_id=request.session_id)
+            return Result.ok(
+                {"context": context, "records": [], "provider": self.id},
+                session_id=request.session_id,
+            )
+
+        if operation in {"after_turn", "remember"}:
+            payload = request.payload
+            scope = dict(payload.get("scope") or {})
+            retracted = (
+                payload.get("retraction_mode") is True
+                or scope.get("retracted") is True
+                or scope.get("retraction_mode") is True
+            )
+            user_text = str(payload.get("user_text", ""))
+            assistant_text = str(payload.get("assistant_text", ""))
+            turn_id = str(scope.get("turn_id") or "")
+            captured = False
+            try:
+                loop = self._turn_loop(request.session_id)
+                if user_text or assistant_text:
+                    captured = bool(await asyncio.to_thread(
+                        loop.sync_turn,
+                        user_text,
+                        assistant_text,
+                        session_id=request.session_id,
+                        run_id=turn_id,
+                    ))
+            except Exception as exc:  # noqa: BLE001
+                return _failure(str(exc), session_id=request.session_id)
+
+            if retracted:
+                return Result.ok(
+                    {
+                        "stored": False,
+                        "captured": captured,
+                        "reason": "correction turn captured",
+                    },
+                    session_id=request.session_id,
+                )
+            explicit = payload.get("explicit") is True
+            if explicit and user_text.strip():
+                digest = hashlib.sha256(
+                    f"{request.session_id}\0{turn_id}\0{user_text}".encode()
+                ).hexdigest()
+                result = await self.remember(
+                    MemoryRecord(
+                        content=user_text.strip(),
+                        kind="fact",
+                        scope=_vault_scope(scope),
+                        metadata={"explicit_user_request": True},
+                        idempotency_key=f"corax:{digest}",
+                    )
+                )
+                if getattr(result, "is_success", False):
+                    return Result.ok(
+                        {**dict(result.payload or {}), "captured": captured},
+                        session_id=request.session_id,
+                    )
+                return result
+            return Result.ok(
+                {
+                    "stored": False,
+                    "captured": captured,
+                    "reason": "turn captured" if captured else "empty turn",
+                },
+                session_id=request.session_id,
+            )
+
+        if operation == "status":
+            return Result.ok(
+                {
+                    "bound": True,
+                    "provider": self.id,
+                    "write_mode": "native",
+                    "auto_capture": _env_flag(
+                        "MNEMONIC_VAULT_AUTO_CAPTURE", True
+                    ),
+                    "auto_recall": _env_flag(
+                        "MNEMONIC_VAULT_AUTO_RECALL", True
+                    ),
+                },
+                session_id=request.session_id,
+            )
+        return Result.fail(
+            CoreError(
+                ErrorCode.INVALID_INPUT,
+                f"unsupported memory loop operation: {operation or '(empty)'}",
+            ),
+            session_id=request.session_id,
         )
 
     async def remember(self, record: MemoryRecord) -> Result:
@@ -171,9 +303,36 @@ class MnemonicVaultProvider(MemoryProvider):
         healthy = await asyncio.to_thread(self._client.health)
         return HealthStatus.HEALTHY if healthy else HealthStatus.DEGRADED
 
+    async def stop(self) -> None:
+        if self._native_loop is not None:
+            await asyncio.to_thread(self._native_loop.shutdown)
 
-def _failure(message: str) -> Result:
+    def _turn_loop(self, session_id: str) -> Any:
+        if self._native_loop is None:
+            self._native_loop = _NativeMemoryLoop(agent="corax")
+        self._native_loop.initialize(session_id or "main", agent_context="primary")
+        return self._native_loop
+
+
+def _vault_scope(value: dict[str, Any]) -> dict[str, str]:
+    scope_type = str(value.get("type") or "").strip().lower()
+    scope_id = str(value.get("id") or "").strip()
+    if scope_type not in _VALID_SCOPE_TYPES:
+        return {"type": "global"}
+    if scope_type != "global" and not scope_id:
+        return {"type": "global"}
+    return {"type": scope_type, **({"id": scope_id} if scope_id else {})}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _failure(message: str, *, session_id: str = "") -> Result:
     return Result.fail(
         CoreError(ErrorCode.CAPABILITY_FAILED, message),
-        session_id="",
+        session_id=session_id,
     )
